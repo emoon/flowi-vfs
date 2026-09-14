@@ -96,6 +96,15 @@ if(FLOWI_VFS_DRIVER_LIBARCHIVE AND NOT TARGET archive_static)
         include(${EXTERNAL}/libarchive/libarchive_preconfig_windows.cmake)
     endif()
 
+    # The preconfig answers its probes with whatever the machine that generated it had, and
+    # three of those answers are optional dev packages rather than facts: libacl and
+    # sys/acl.h, and e2fsprogs' ext2fs/ext2_fs.h. ACL and xattr support is off above, and
+    # ext2 file flags are a writer's concern, so force all three absent rather than make a
+    # clone install packages to build a reader.
+    set(HAVE_ACL_LIBACL_H "" CACHE STRING "" FORCE)
+    set(HAVE_SYS_ACL_H "" CACHE STRING "" FORCE)
+    set(HAVE_EXT2FS_EXT2_FS_H "" CACHE STRING "" FORCE)
+
     add_subdirectory(${EXTERNAL}/libarchive ${CMAKE_CURRENT_BINARY_DIR}/_dep/libarchive)
     if(TARGET archive_static)
         target_compile_options(archive_static PRIVATE -w)
