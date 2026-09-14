@@ -1,0 +1,17 @@
+# flowi-vfs's codegen entry point. Dev-only: nothing this repository ships depends on it,
+# and it is deliberately its OWN workspace so api_gen's dependency tree never reaches the
+# Cargo.lock of the shipped flowi_vfs_sys / flowi_vfs crates.
+#
+# Run it with `cargo regen` (aliased in .cargo/config.toml).
+[package]
+name = "flowi-vfs-codegen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Pinned to an exact reviewed commit: the generator version that produced the committed
+# output must be the one that runs, or the drift test depends on when it ran.
+api_gen = { git = "https://github.com/emoon/api-gen", rev = "3fa434b50ec045871ec83a3759f878e77a7f9d75" }
+
+[workspace]

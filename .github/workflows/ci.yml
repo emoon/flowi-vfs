@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# flowi-core is a sibling checkout, which is what CMakeLists.txt and the cargo path
+# dependencies both default to. Every job that builds anything needs it.
+env:
+  FLOWI_CORE_REF: main
+
+jobs:
+  c:
+    name: C library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: flowi-vfs
+      - uses: actions/checkout@v4
+        with:
+          repository: emoon/flowi-core
+          ref: ${{ env.FLOWI_CORE_REF }}
+          path: flowi-core
+      - name: Install the codec libraries libarchive is pinned to
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libbz2-dev liblzma-dev libssl-dev
+
+      # Static is what an embedder links; shared is the stricter check. Building both
+      # keeps the two configurations honest against each other.
+      - name: Build static, every driver on
+        working-directory: flowi-vfs
+        run: |
+          cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-static -j$(nproc)
+
+      # -Wl,--no-undefined is the point of this job: it fails the link if the VFS names a
+      # symbol nothing in the closure defines, which is what "it stands alone over core"
+      # means. A static archive would happily carry the same dangling reference.
+      - name: Build shared, with symbol closure enforced
+        working-directory: flowi-vfs
+        run: |
+          cmake -S . -B build-shared -DCMAKE_BUILD_TYPE=Release \
+            -DFLOWI_VFS_SHARED=ON \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--no-undefined"
+          cmake --build build-shared -j$(nproc)
+
+      # The configuration flowi uses. It must keep working, and it is the one that proves
+      # the engine does not quietly depend on a driver being present.
+      - name: Build with every driver off
+        working-directory: flowi-vfs
+        run: |
+          cmake -S . -B build-bare -DCMAKE_BUILD_TYPE=Release \
+            -DFLOWI_VFS_DRIVER_LIBARCHIVE=OFF \
+            -DFLOWI_VFS_DRIVER_LHASA=OFF \
+            -DFLOWI_VFS_DRIVER_UNLZX=OFF
+          cmake --build build-bare -j$(nproc)
+
+      # The shared library's dependency set is pinned in CMakeLists.txt rather than probed,
+      # so anything outside this list means a codec leaked in from the build machine.
+      - name: Dependencies are only the pinned codecs, libm and libc
+        working-directory: flowi-vfs
+        run: |
+          objdump -p build-shared/libflowi_vfs.so | grep NEEDED
+          unexpected=$(objdump -p build-shared/libflowi_vfs.so \
+            | awk '/NEEDED/ {print $2}' \
+            | grep -vE "^(libz\.so|libbz2\.so|liblzma\.so|libcrypto\.so|libssl\.so|libm\.so|libc\.so|ld-linux)" || true)
+          if [ -n "$unexpected" ]; then
+            echo "unexpected DT_NEEDED: $unexpected" >&2
+            exit 1
+          fi
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: flowi-vfs
+      - uses: actions/checkout@v4
+        with:
+          repository: emoon/flowi-core
+          ref: ${{ env.FLOWI_CORE_REF }}
+          path: flowi-core
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install the codec libraries libarchive is pinned to
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libbz2-dev liblzma-dev libssl-dev
+
+      # The generated bindings are deliberately not rustfmt-formatted - api_gen emits
+      # them pre-canonicalised and the drift gate compares bytes - so they are excluded
+      # here exactly as the pre-commit hook excludes them.
+      #
+      # skip_children is what makes the exclusion hold: without it, rustfmt on a crate
+      # root follows `mod generated;` and checks the very files the find excluded. It is
+      # a nightly option, but passing it through --config is accepted on stable.
+      - name: Format
+        working-directory: flowi-vfs/rust
+        run: |
+          find . -name '*.rs' -not -path '*/generated/*' -not -path '*/target/*' \
+            -print0 | xargs -0 rustfmt --edition 2021 --config skip_children=true --check
+
+      - name: Clippy
+        working-directory: flowi-vfs/rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Builds the C library through build.rs and links against it, so this also covers
+      # the default `native` path.
+      - name: Test
+        working-directory: flowi-vfs/rust
+        run: cargo test --workspace --locked
+
+  codegen:
+    name: Codegen is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: flowi-vfs
+      # The drift check parses flowi-core's defs as reference_dirs, so it needs them
+      # present even though it emits nothing for them.
+      - uses: actions/checkout@v4
+        with:
+          repository: emoon/flowi-core
+          ref: ${{ env.FLOWI_CORE_REF }}
+          path: flowi-core
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Regenerates from api/*.def into a temp dir and compares against the committed
+      # headers, bindings and export lists. Never mutates the tree; names the file that
+      # drifted.
+      - name: Drift gate
+        working-directory: flowi-vfs
+        run: cargo regen-check

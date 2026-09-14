@@ -1,0 +1,29 @@
+[package]
+name = "flowi_vfs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["native"]
+# Forwarded to flowi_vfs_sys: build and link the native library. A host whose own build
+# already links a library containing the VFS turns this off.
+native = ["flowi_vfs_sys/native"]
+
+[dependencies]
+flowi_vfs_sys = { path = "../flowi_vfs_sys", default-features = false }
+# The C foundation's safe surface - the arena, jobs and the FFI-boundary kit the VFS
+# wrapper builds on. `default-features = false` for the same reason flowi_vfs_sys sets it
+# on flowi_core_sys: the linked library already contains core, and the process must hold
+# one copy.
+flowi_core = { path = "../../../flowi-core/rust/flowi_core", default-features = false }
+# The logging facade the VFS reports a panicking read transform through. flowi_core
+# installs the bridge that turns a `log` record into a flowi channel record.
+log = "0.4"
+
+[lib]
+doctest = false
+
+# Inherit the workspace lint policy (see rust/Cargo.toml).
+[lints]
+workspace = true

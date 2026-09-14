@@ -1,0 +1,38 @@
+[package]
+name = "flowi_vfs_sys"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# `links` reserves the native flowi-vfs library so cargo serialises build-script
+# metadata and rejects a second crate linking the same C aggregate.
+links = "flowi_vfs"
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[features]
+default = ["native"]
+# Build and link the native library. A host whose own build already links a library
+# containing the VFS - flowi's libflowi.so bundles it - turns this off so the symbols
+# resolve from there instead of from a second copy. The three FLOWI_VFS_SYS_*
+# environment variables in build.rs cover the same ground for a driving build system
+# that cannot set cargo features.
+native = []
+
+[dependencies]
+# The C foundation's ABI. `default-features = false` drops its native build: the
+# flowi_vfs library this crate links already bundles core, and a second copy in the
+# process is what the plugin export check exists to reject. Its types are re-exported
+# from this crate's root, so the generated bindings' `crate::Arena` / `crate::RawStr`
+# paths keep resolving.
+flowi_core_sys = { path = "../../../flowi-core/rust/flowi_core_sys", default-features = false }
+# Backs the generated bitflags-mirror types.
+bitflags = "2"
+
+[build-dependencies]
+cmake = "0.1"
+
+# Inherit the workspace lint policy (see rust/Cargo.toml).
+[lints]
+workspace = true

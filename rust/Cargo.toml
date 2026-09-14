@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["flowi_vfs_sys", "flowi_vfs"]
+
+# The lint policy every member inherits with `lints.workspace = true`. Single-sourced
+# here so `cargo clippy -- -D warnings` on the command line applies exactly what CI
+# enforces.
+#
+# `unsafe_code` itself is not denied: this workspace *is* the boundary — flowi_vfs_sys
+# is the raw C ABI and flowi_vfs wraps it. What is enforced is that the unsafe be
+# spelled out and justified.
+[workspace.lints.rust]
+# An `unsafe fn` is not its own `unsafe` block: every raw operation inside one still has
+# to name itself, so the SAFETY comment sits on the operation rather than on the whole
+# function.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Every `unsafe` block states the invariant that makes it sound. api_gen emits the
+# exemption per generated file, only where an `unsafe` block actually appears.
+undocumented_unsafe_blocks = "deny"

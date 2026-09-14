@@ -1,0 +1,179 @@
+#pragma once
+
+#include <core/string.h>
+#include <core/jobsys.h>
+#include <core/types.h>
+#include <flowi/vfs/vfs_api.h>
+#include <flowi/vfs/vfs_plugin.h>
+
+struct FlArena;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// VFS Operation Status - Hierarchical 32-bit error system (internal use only)
+
+typedef u32 VfsOpStatus;
+
+// Bits 0-7: Core VFS state (256 values)
+#define VFS_STATE_MASK 0x000000FF
+#define VFS_STATE_SUCCESS 0x00000000
+#define VFS_STATE_PENDING 0x00000001
+#define VFS_STATE_ERROR 0x00000002
+#define VFS_STATE_CLOSED 0x00000003
+#define VFS_STATE_NONE 0x00000004
+
+// Bits 8-15: VFS subsystem errors (256 values)
+#define VFS_SUBSYSTEM_MASK 0x0000FF00
+#define VFS_SUBSYSTEM_SHIFT 8
+#define VFS_MOUNT_ERROR 0x00000100
+#define VFS_DRIVER_ERROR 0x00000200
+#define VFS_CACHE_ERROR 0x00000300
+#define VFS_NETWORK_ERROR 0x00000400
+#define VFS_ARCHIVE_ERROR 0x00000500
+#define VFS_PATH_ERROR 0x00000600
+#define VFS_PERMISSION_ERROR 0x00000700
+#define VFS_CANCELED_ERROR 0x00000800
+
+// Bits 16-31: Available for callback/user errors (65536 values)
+#define VFS_USER_MASK 0xFFFF0000
+#define VFS_USER_SHIFT 16
+
+// Common error combinations for convenience
+#define VFS_ERROR_MOUNT (VFS_STATE_ERROR | VFS_MOUNT_ERROR)
+#define VFS_ERROR_DRIVER (VFS_STATE_ERROR | VFS_DRIVER_ERROR)
+#define VFS_ERROR_CACHE (VFS_STATE_ERROR | VFS_CACHE_ERROR)
+#define VFS_ERROR_NETWORK (VFS_STATE_ERROR | VFS_NETWORK_ERROR)
+#define VFS_ERROR_ARCHIVE (VFS_STATE_ERROR | VFS_ARCHIVE_ERROR)
+#define VFS_ERROR_PATH (VFS_STATE_ERROR | VFS_PATH_ERROR)
+#define VFS_ERROR_PERMISSION (VFS_STATE_ERROR | VFS_PERMISSION_ERROR)
+// Additional error codes for driver use
+#define VFS_ERROR_FILE_NOT_FOUND (VFS_STATE_ERROR | VFS_DRIVER_ERROR)
+#define VFS_ERROR_READ (VFS_STATE_ERROR | VFS_DRIVER_ERROR)
+#define VFS_ERROR_INVALID_PATH (VFS_STATE_ERROR | VFS_PATH_ERROR)
+#define VFS_ERROR_CANCELED (VFS_STATE_ERROR | VFS_CANCELED_ERROR)
+#define VFS_ERROR_FILE_TOO_LARGE (VFS_STATE_ERROR | VFS_DRIVER_ERROR)
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Callback invoked once per discovered entry during directory listing
+
+typedef void (*VfsListingCallback)(FlVfsEntry entry, void* user_data);
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Initialize the VFS system. Registers the built-in LocalFS driver, which stays the catch-all fallback,
+// tried after every driver registered later via vfs_register_driver().
+// Returns true if this call initialized the VFS (the caller owns it and should call vfs_destroy),
+// false if it was already initialized (first-caller-wins; this call was a no-op).
+bool vfs_init(struct FlArena* arena);
+
+void vfs_destroy(void);
+
+// Pump the VFS: process deferred/rate-limited operations and poll file watchers
+// for filesystem changes. Call once per frame to advance async I/O.
+void vfs_update(void);
+
+
+// Convenience macro for mounting with default options
+#define vfs_mount(source_path) vfs_mount_with_options(source_path, (FlVfsMountOptions) { 0 })
+
+
+// Returns 0 if the mount completed synchronously or mount is null
+FlJobHandle vfs_mount_get_job_handle(FlVfsMount* mount);
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+typedef struct VfsReadOptions {
+    FlVfsReadCallback callback;
+    void* user_data;
+    FlVfsHandle reuse_handle; // Handle to reuse (or FL_VFS_HANDLE_INVALID/0)
+} VfsReadOptions;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// File Operations on Mounts
+
+
+// Get size of an open file (synchronous)
+// Returns: Size result with file size (negative on error)
+FlVfsSizeResult vfs_get_size(FlVfsHandle file_handle);
+
+
+// Two-phase read: allocate handle without dispatching the job.
+// Must be followed by vfs_dispatch() to actually start the operation.
+FlVfsHandle vfs_mount_read_all_prepare(FlVfsMount* mount, FlString relative_path, FlVfsReadCallback callback,
+                                       void* user_data, FlVfsHandle reuse_handle);
+
+// Dispatch a previously prepared handle (from vfs_mount_read_all_prepare).
+void vfs_dispatch(FlVfsHandle handle);
+
+#define vfs_mount_read_all(mount, path, ...)                                                               \
+    ({                                                                                                     \
+        VfsReadOptions _opts = { __VA_ARGS__ };                                                            \
+        vfs_mount_read_all_with_options(mount, path, _opts.callback, _opts.user_data, _opts.reuse_handle); \
+    })
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Handle Operations
+
+
+void vfs_wait_all(void);
+
+// Schedule a job to run after a VFS operation completes
+// Note: From worker threads, this schedules immediately (VFS ops are sync there)
+FlJobHandle vfs_schedule_job(FlVfsHandle handle, FlJobsFunc func, void* user_data);
+
+
+VfsOpStatus vfs_get_status(FlVfsHandle handle);
+
+
+// Note: This is cooperative cancellation - the operation will check for cancellation
+//       at strategic points and bail out gracefully. The handle must still be closed
+//       with vfs_close() after cancellation.
+bool vfs_cancel(FlVfsHandle handle);
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Debug and Introspection
+
+void vfs_dump_tree(FlVfsMount* mount);
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Fuzzy filtering
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static inline VfsOpStatus vfs_get_core_state(VfsOpStatus status) {
+    return status & VFS_STATE_MASK;
+}
+
+static inline u32 vfs_get_subsystem_error(VfsOpStatus status) {
+    return status & VFS_SUBSYSTEM_MASK;
+}
+
+static inline u32 vfs_get_user_error(VfsOpStatus status) {
+    return status & VFS_USER_MASK;
+}
+
+static inline bool vfs_is_success(VfsOpStatus status) {
+    return vfs_get_core_state(status) == VFS_STATE_SUCCESS;
+}
+
+static inline bool vfs_is_error(VfsOpStatus status) {
+    return vfs_get_core_state(status) == VFS_STATE_ERROR;
+}
+
+static inline bool vfs_is_pending(VfsOpStatus status) {
+    return vfs_get_core_state(status) == VFS_STATE_PENDING;
+}
+
+static inline bool vfs_is_closed(VfsOpStatus status) {
+    return vfs_get_core_state(status) == VFS_STATE_CLOSED;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Driver Registration (for extending VFS)
+//
+// Hand a constructed driver to the VFS. Call after vfs_init(). The plugin pointer must outlive the VFS.
+// instance: Optional driver instance handle passed to every driver op (NULL for stateless drivers)
+void vfs_register_driver(const FlVfsPlugin* plugin, void* instance);
