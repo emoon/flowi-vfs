@@ -44,6 +44,42 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 ################################################################################
+
+# Warnings are errors, with no opt-out. A warning a newer compiler starts emitting breaks
+# the build on purpose: that is the point at which it is cheapest to deal with, and a
+# warning nobody is forced to read is one nobody reads.
+#
+# This block has to be here rather than inherited. apply_target_config() applies
+# ${WARNING_FLAGS} as read from whichever project calls it, so without a local set() a
+# standalone build gave flowi_vfs no flags at all - not even -Wall - and this repo's own CI
+# could not have caught a warning in its own sources. Inside flowi the value is the same
+# one flowi already sets.
+#
+# Unlike flowi-core there is no compiler-ID guard around this: that guard exists there only
+# because the SIMD flags need it, and no source here uses SIMD. Keeping it out means a real
+# cl.exe build gets /W3 /WX too, not just clang-cl.
+#
+# The vendored driver libraries below are untouched - WARNING_FLAGS only reaches flowi_vfs,
+# through apply_target_config(). -Werror on third-party sources means a compiler upgrade
+# breaks the build on code we do not own.
+#
+# clang-cl reads -Wall as MSVC's /Wall, which is clang's -Weverything - pedantic warnings
+# this code does not aim at. /W1../W3 is where it keeps the GNU meaning.
+if(MSVC)
+    # MSVC deprecates fopen, getenv and friends in favour of its own _s variants. They are
+    # standard C and used correctly here, so under /WX that deprecation is the one thing
+    # that would fail the build without naming a real defect. Silence it rather than write
+    # non-portable code; the vendored libraries each already do the same for themselves.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    set(WARNING_FLAGS "/W3" "/WX")
+else()
+    set(WARNING_FLAGS "-Wall" "-Werror")
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    list(APPEND WARNING_FLAGS "-Wno-initializer-overrides")
+endif()
+
+################################################################################
 # Vendored driver libraries
 #
 # Each is added only when its driver is on, so a build without the driver neither
