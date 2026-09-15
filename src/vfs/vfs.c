@@ -353,7 +353,9 @@ static FlVfsHandle allocate_op_ex(VfsState* self, FlVfsMount* mount, FlString pa
     FL_VALIDATE_RET(handle != nullptr, FL_VFS_HANDLE_INVALID);
 
     handle->target_arena = target_arena;
-    handle->filter_needle = filter_needle;
+    // Copied like the path above: the job matches against this long after the caller's frame is gone, and
+    // callers filter with scratch strings. An empty or static needle copies to itself, without allocating.
+    handle->filter_needle = string_allocator_copy(mount->strings, filter_needle);
     handle->depth = depth;
 
     // Set open_flags BEFORE scheduling job to avoid race condition
@@ -729,9 +731,11 @@ static void vfs_free_handle_resources(VfsState* self, VfsHandleData* handle_data
         arena_destroy(handle_data->result_arena);
     }
 
-    // Free handle path string (allocated from mount's StringAllocator)
-    if (handle_data->mount && handle_data->path.length > 0) {
+    // Free the handle's strings (allocated from the mount's StringAllocator). Both free calls no-op on the
+    // empty and static strings a handle without a path or filter holds.
+    if (handle_data->mount) {
         string_allocator_free(handle_data->mount->strings, handle_data->path);
+        string_allocator_free(handle_data->mount->strings, handle_data->filter_needle);
     }
 }
 

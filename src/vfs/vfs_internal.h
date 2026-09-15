@@ -167,7 +167,7 @@ struct VfsHandleData {
 
     // Fuzzy filter fields
     FlVfsDirHandle source_list_handle;
-    FlString filter_needle; // Optional filter string for fuzzy filtering during listing
+    FlString filter_needle; // Optional fuzzy filter for the listing; mount-owned copy, like path above
 
     // File operation fields (for VfsOp_FileOpen)
     VfsPluginEntry* plugin_entry; // Resolved plugin entry (from tree walk)
