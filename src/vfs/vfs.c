@@ -59,7 +59,8 @@ typedef struct VfsHandleSnapshot {
     FlString path;
     int depth;
     u32 snapshot_version;
-    bool ready; // Job finished (or none scheduled)
+    bool ready;            // Job finished (or none scheduled)
+    bool dispatch_pending; // Job scheduled but its handle not stored yet, so job_handle below reads 0
     void* result_data;
     VfsOpStatus error_status;
     VfsPluginEntry* plugin_entry;
@@ -124,8 +125,10 @@ static bool vfs_snapshot_handle(FlVfsHandle handle, VfsHandleSnapshot* out) {
     out->mount = handle_data->mount;
     out->path = handle_data->path;
     out->depth = handle_data->depth;
-    out->ready
-        = (handle_data->job_handle == 0) || (fl_jobs_is_finished(handle_data->job_handle) != FlJobsResult_NotFinished);
+    out->dispatch_pending = atomic_load_explicit(&handle_data->dispatch_pending, memory_order_acquire);
+    out->ready = !out->dispatch_pending
+                 && ((handle_data->job_handle == 0)
+                     || (fl_jobs_is_finished(handle_data->job_handle) != FlJobsResult_NotFinished));
 
     // The fields below are plain-written by the handle's own job worker, so they may only be read once the
     // job is finished (the completion check above gives the happens-before). Before that they read as unset.
@@ -531,7 +534,7 @@ void vfs_wait(FlVfsHandle handle) {
 
     // Wait lock-free: the job itself takes handle_lock (see vfs_close). last_job covers reads/writes
     // chained onto a file handle after its open job finished.
-    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job))) {
+    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job)) || snap.dispatch_pending) {
         logc_error(VFS_ID,
                    "vfs_wait(%u) from a job worker cannot block; the operation is still running. Wait for an "
                    "in-flight handle from the main thread.",
@@ -760,7 +763,9 @@ void vfs_close(FlVfsHandle handle) {
 
     // On a job worker the wait does nothing, so a job unfinished here stays unfinished. Freeing now would
     // pull VfsHandleData, the result buffer and the plugin file handle out from under the running job.
-    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job))) {
+    // A pending dispatch is the same refusal for a different reason: the job is already scheduled and its
+    // handle is not stored yet, so there is nothing here to wait on and freeing would race the job.
+    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job)) || snap.dispatch_pending) {
         logc_error(VFS_ID,
                    "vfs_close(%u) from a job worker cannot wait out the running operation; the handle stays "
                    "open. Close an in-flight handle from the main thread.",
@@ -859,6 +864,11 @@ void vfs_dispatch(FlVfsHandle handle) {
     mutex_lock(&self->handle_lock);
     VfsHandleData* handle_data = vfs_lookup_handle_locked(self, handle);
     FlVfsMount* mount = handle_data ? handle_data->mount : nullptr;
+    if (handle_data) {
+        // Before scheduling: the worker can reach the job, and a caller can observe the handle, while
+        // job_handle below is still 0.
+        atomic_store_explicit(&handle_data->dispatch_pending, true, memory_order_release);
+    }
     mutex_unlock(&self->handle_lock);
 
     if (!handle_data) {
@@ -873,6 +883,7 @@ void vfs_dispatch(FlVfsHandle handle) {
     if (vfs_lookup_handle_locked(self, handle) == handle_data) {
         handle_data->job_handle = job;
         handle_data->last_job = job;
+        atomic_store_explicit(&handle_data->dispatch_pending, false, memory_order_release);
     }
     mutex_unlock(&self->handle_lock);
 }

@@ -148,6 +148,10 @@ struct FlVfsMount {
 
 struct VfsHandleData {
     FlJobHandle job_handle;
+    // job_handle 0 means "no job, result already published" everywhere except between vfs_dispatch scheduling
+    // the job and storing its handle. This marks that window so a handle whose job is queued or running is not
+    // mistaken for a finished one.
+    _Atomic bool dispatch_pending;
     FlVfsMount* mount;
     FlString path;
     _Atomic(void*) result_data; // Points to FlVfsData, FlVfsFileList, etc. (atomic for thread safety)
