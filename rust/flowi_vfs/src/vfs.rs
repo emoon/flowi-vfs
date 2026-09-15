@@ -566,9 +566,10 @@ impl Mount {
     /// A worker must not poll vfs_is_ready instead: that burns a worker core and,
     /// worse, can deadlock - the VFS runs its own work on the same pool, so a worker
     /// spinning on vfs_is_ready may be spinning on a job that needs the slot it is
-    /// occupying. The blocking wait behind [`WorkerMount`] participates in the job
-    /// system instead, so a waiting worker keeps stealing work. The blocking calls
-    /// live only here: on the frame loop they would be a stall.
+    /// occupying. [`WorkerMount`] avoids both: on a worker the job system runs a
+    /// newly scheduled job inline, so each operation there is complete by the time
+    /// its launch returns. The blocking calls live only here: on the frame loop they
+    /// would be a stall.
     ///
     /// # Safety
     /// The mount must stay open until every holder of the returned view - and every
@@ -630,15 +631,34 @@ impl Drop for OwnedMount {
 /// all reachable; the three operations below shadow their async namesakes, so the
 /// handle you are holding decides which surface you get. Never use it on the frame
 /// loop: every call here waits.
+///
+/// Each operation below launches the ticket or tickets it needs and closes them
+/// before returning, which is what makes the surface safe on a job worker: the
+/// job system runs a job scheduled from a worker inline, so a ticket is finished
+/// by the time the wait and close reach it.
+///
+/// [`WorkerMount::read_prefix`] is the exception worth naming, because it chains:
+/// it opens a file and then reads through that open handle, and a chained op does
+/// not go through the job system at all. It is sound for a narrower reason - it
+/// chains only onto the ticket it opened itself, in the same call, which is
+/// therefore already complete - so the C side's refusal for a chain onto an
+/// unfinished predecessor (`VFS_ERROR_WOULD_BLOCK`) cannot trigger here. A method
+/// added below that chains onto a handle from anywhere else does not inherit that
+/// and must handle the refusal.
+///
+/// A ticket launched on another thread is not usable through this view at all -
+/// `vfs_wait` cannot block a worker, and `vfs_close` refuses there rather than
+/// free an operation that is still running.
 pub struct WorkerMount {
     mount: Mount,
 }
 
-// SAFETY: the C VFS is internally synchronized - it runs its own reads and
-// listings on the job system's worker pool, and vfs_wait is the job-system-aware
-// wait - so the operations below are callable from any thread. What is not
-// thread-safe about a mount is its lifetime, and that is exactly the promise
-// Mount::worker_view extracts from its caller. Sync is deliberately not
+// SAFETY: the C VFS is internally synchronized - it owns the locks over its mount,
+// handle and tree state - so the operations below are callable from any thread, and
+// each one only ever waits on a ticket it launched in that same call (see the type
+// docs for why that is sound on a worker, read_prefix's chained pair included).
+// What is not thread-safe about a mount is its lifetime, and that is exactly the
+// promise Mount::worker_view extracts from its caller. Sync is deliberately not
 // implemented: nothing needs to share one view between threads, and without it a
 // &Mount (which is !Sync) cannot be reached from another thread through this.
 unsafe impl Send for WorkerMount {}
@@ -1871,8 +1891,8 @@ mod tests {
     #[test]
     fn a_worker_view_reads_blocking_on_the_thread_that_holds_it() {
         reset_fake(FakeState {
-            // Never ready by polling: only the job-system-aware wait resolves it,
-            // which is the whole point of the blocking surface.
+            // Never ready by polling: only the fake's wait flips it ready, which is
+            // what makes this exercise the blocking surface rather than a poll.
             polls_until_ready: i32::MAX,
             data: b"payload".to_vec(),
             entries: vec![entry("a", false), entry("b", true)],
@@ -1945,7 +1965,7 @@ mod tests {
         assert_eq!(bytes, b"from the worker");
         assert_eq!(count, 2);
         assert_eq!(source, "/fake/source");
-        // Both operations went through the job-system-aware wait, on that thread.
+        // Both operations reached their wait on that thread rather than polling.
         assert_eq!(waits, 2);
     }
 

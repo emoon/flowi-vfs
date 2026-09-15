@@ -86,10 +86,15 @@ static VfsHandleJobs vfs_handle_jobs(FlJobHandle job_handle, FlJobHandle last_jo
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static void vfs_wait_handle_jobs(VfsHandleJobs jobs) {
+// Returns false if a job is still running afterwards: fl_jobs_wait() is a no-op on a job worker, so a
+// caller that would free the handle on the strength of the wait must bail instead.
+static bool vfs_wait_handle_jobs(VfsHandleJobs jobs) {
+    bool finished = true;
     for (u32 i = 0; i < jobs.count; ++i) {
         fl_jobs_wait(jobs.handles[i]);
+        finished = finished && fl_jobs_is_finished(jobs.handles[i]) != FlJobsResult_NotFinished;
     }
+    return finished;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -524,7 +529,12 @@ void vfs_wait(FlVfsHandle handle) {
 
     // Wait lock-free: the job itself takes handle_lock (see vfs_close). last_job covers reads/writes
     // chained onto a file handle after its open job finished.
-    vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job));
+    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job))) {
+        logc_error(VFS_ID,
+                   "vfs_wait(%u) from a job worker cannot block; the operation is still running. Wait for an "
+                   "in-flight handle from the main thread.",
+                   handle);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -736,14 +746,23 @@ void vfs_close(FlVfsHandle handle) {
         return;
     }
 
-    // Wait for pending operations BEFORE taking handle_lock: fl_jobs_wait() busy-waits until the job
-    // runs, and the job looks up its handle under that same lock. last_job covers the reads and writes
-    // chained onto a file handle, which still dereference it on their worker.
+    // Wait for pending operations BEFORE taking handle_lock: the wait blocks until the job runs, and the
+    // job looks up its handle under that same lock. last_job covers the reads and writes chained onto a
+    // file handle, which still dereference it on their worker.
     VfsHandleSnapshot snap;
     if (!vfs_snapshot_handle(handle, &snap)) {
         return;
     }
-    vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job));
+
+    // On a job worker the wait does nothing, so a job unfinished here stays unfinished. Freeing now would
+    // pull VfsHandleData, the result buffer and the plugin file handle out from under the running job.
+    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job))) {
+        logc_error(VFS_ID,
+                   "vfs_close(%u) from a job worker cannot wait out the running operation; the handle stays "
+                   "open. Close an in-flight handle from the main thread.",
+                   handle);
+        return;
+    }
 
     mutex_lock(&self->handle_lock);
 
@@ -943,8 +962,21 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
     op_handle->write_data_owned = params->write_data_owned;
     op_handle->mount = mount;
 
+    bool chain_refused = false;
+
     if (!fl_jobs_is_main_thread()) {
-        vfs_ops_execute_sync(op_handle);
+        // A worker runs the op inline, which is only correct once chain_after has finished: it cannot wait
+        // for the predecessor, and running anyway would read the file handle before its open filled it in.
+        if (chain_after != 0 && fl_jobs_is_finished(chain_after) == FlJobsResult_NotFinished) {
+            logc_error(VFS_ID,
+                       "vfs_%s from a job worker cannot wait for the operation it chains onto; issue it from "
+                       "the main thread",
+                       op_name);
+            atomic_store_explicit(&op_handle->error_status, VFS_ERROR_WOULD_BLOCK, memory_order_release);
+            chain_refused = true;
+        } else {
+            vfs_ops_execute_sync(op_handle);
+        }
         op_handle->job_handle = 0;
     } else {
         op_handle->job_handle = fl_jobs_add_job_with_dependency(vfs_ops_do_job, op_handle, chain_after);
@@ -953,8 +985,9 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
 
     mutex_lock(&self->handle_lock);
     VfsHandleData* file_now = vfs_lookup_handle_locked(self, file_handle);
-    if (file_now) {
-        // Next operation (or close) chains after this op; 0 for the synchronous path
+    if (file_now && !chain_refused) {
+        // Next operation (or close) chains after this op; 0 for the synchronous path. A refused chain never
+        // ran, so the predecessor it could not wait for is still what the file handle must wait for.
         file_now->last_job = op_handle->job_handle;
     }
     hashmap_insert(&self->handle_map, op_id, op_handle);

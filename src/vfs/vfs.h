@@ -32,6 +32,7 @@ typedef u32 VfsOpStatus;
 #define VFS_PATH_ERROR 0x00000600
 #define VFS_PERMISSION_ERROR 0x00000700
 #define VFS_CANCELED_ERROR 0x00000800
+#define VFS_THREADING_ERROR 0x00000900
 
 // Bits 16-31: Available for callback/user errors (65536 values)
 #define VFS_USER_MASK 0xFFFF0000
@@ -51,6 +52,8 @@ typedef u32 VfsOpStatus;
 #define VFS_ERROR_INVALID_PATH (VFS_STATE_ERROR | VFS_PATH_ERROR)
 #define VFS_ERROR_CANCELED (VFS_STATE_ERROR | VFS_CANCELED_ERROR)
 #define VFS_ERROR_FILE_TOO_LARGE (VFS_STATE_ERROR | VFS_DRIVER_ERROR)
+// The op could only have proceeded by waiting on a job worker, which the job system forbids
+#define VFS_ERROR_WOULD_BLOCK (VFS_STATE_ERROR | VFS_THREADING_ERROR)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Callback invoked once per discovered entry during directory listing
@@ -114,6 +117,15 @@ void vfs_dispatch(FlVfsHandle handle);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Handle Operations
+//
+// Thread contract: fl_jobs_wait() does nothing on a job worker, because blocking one on a job that itself
+// needs a worker can deadlock the pool. A worker can therefore only finish an operation that has already
+// finished, and the calls below fail closed rather than pretend otherwise: vfs_wait() logs and returns,
+// vfs_close() logs and leaves the handle open instead of freeing state the running job still uses, and a
+// read/write chained onto an unfinished predecessor completes with VFS_ERROR_WOULD_BLOCK instead of running
+// against a file that is not open yet. Wait for, close, and chain onto in-flight handles from the main
+// thread. Handles a worker opened itself are unaffected - the job system runs those inline, so they are
+// already finished. vfs_mount_close() and vfs_destroy() are main-thread teardown and are not guarded.
 
 
 void vfs_wait_all(void);
