@@ -147,9 +147,10 @@ FL_API uint32_t vfs_get_listing_filtered(FlVfsMount* mount, FlString relative_pa
 FL_API uint32_t vfs_apply_fuzzy_filter(uint32_t source_handle, FlString needle);
 // Check if an async operation is complete (non-blocking).
 FL_API bool vfs_is_ready(uint32_t handle);
-// Block until an async operation completes. The wait participates in the job
-// system - a worker thread that calls it keeps stealing work instead of idling -
-// so it is safe from inside a job body. Never call it from the frame loop.
+// Block until an async operation completes. Never call it from the frame loop,
+// and never from a job body either: the job system refuses to block a worker on
+// a job that may itself need a worker, so there the call logs and returns with
+// the operation still running.
 FL_API void vfs_wait(uint32_t handle);
 // Get the data from a completed read operation. Call only after vfs_is_ready.
 FL_API FlVfsData vfs_get_data(uint32_t handle);
@@ -158,7 +159,10 @@ FL_API FlVfsData vfs_get_data(uint32_t handle);
 FL_API FlVfsFileList vfs_get_file_list(uint32_t handle);
 // Update the priority of a pending operation.
 FL_API void vfs_set_priority(uint32_t handle, FlVfsLoadPriority priority);
-// Close a handle and clean up its resources.
+// Close a handle and clean up its resources. Never blocks: a handle whose
+// operation is still running is cancelled and its ticket, result buffer and read
+// callback are reclaimed by a later vfs_update(), once the worker has let go of
+// it. The handle stops answering vfs_is_ready and vfs_get_data either way.
 FL_API void vfs_close(uint32_t handle);
 // Check if a directory listing is still current (its version matches the
 // current mount version).

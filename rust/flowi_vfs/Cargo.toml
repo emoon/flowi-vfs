@@ -21,6 +21,14 @@ flowi_core = { path = "../../../flowi-core/rust/flowi_core", default-features = 
 # installs the bridge that turns a `log` record into a flowi channel record.
 log = "0.4"
 
+# The native cancellation coverage under tests/ drives the real C VFS, so it needs the raw
+# ABI on both sides: the job system it gates the worker with, and vfs_update. Both crates are
+# already in the graph; an integration test is its own crate and cannot reach them through
+# this one.
+[dev-dependencies]
+flowi_core_sys = { path = "../../../flowi-core/rust/flowi_core_sys", default-features = false }
+flowi_vfs_sys = { path = "../flowi_vfs_sys", default-features = false }
+
 [lib]
 doctest = false
 

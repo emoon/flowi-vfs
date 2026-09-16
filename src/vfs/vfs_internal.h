@@ -196,6 +196,11 @@ struct VfsHandleData {
 
     /// Cancellation support - cooperative cancellation flag
     _Atomic bool cancel_requested;
+
+    /// Set by vfs_close when the operation was still running: the owner is done with the handle, but the
+    /// job still reaches it by pointer, so reclamation waits for the main-thread sweep. A handle with this
+    /// set no longer answers any public query - see vfs_lookup_open_handle_locked.
+    _Atomic bool close_requested;
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -226,6 +231,10 @@ typedef struct VfsState {
 
     pool(VfsHandleData) handle_pool;
     pool(FlVfsMount) vfs_mounts;
+
+    // How many handles in handle_map are waiting for the deferred-close sweep. Mutated under handle_lock,
+    // but read without it so an idle frame's sweep costs one load.
+    _Atomic u32 pending_close_count;
 
     hashmap(u32, VfsHandleData*) handle_map;
 

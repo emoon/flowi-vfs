@@ -194,9 +194,10 @@ extern "C" {
     pub fn vfs_apply_fuzzy_filter(source_handle: u32, needle: crate::RawStr) -> u32;
     /// Check if an async operation is complete (non-blocking).
     pub fn vfs_is_ready(handle: u32) -> bool;
-    /// Block until an async operation completes. The wait participates in the job
-    /// system - a worker thread that calls it keeps stealing work instead of idling -
-    /// so it is safe from inside a job body. Never call it from the frame loop.
+    /// Block until an async operation completes. Never call it from the frame loop,
+    /// and never from a job body either: the job system refuses to block a worker on
+    /// a job that may itself need a worker, so there the call logs and returns with
+    /// the operation still running.
     pub fn vfs_wait(handle: u32);
     /// Get the data from a completed read operation. Call only after vfs_is_ready.
     pub fn vfs_get_data(handle: u32) -> crate::VfsData;
@@ -205,7 +206,10 @@ extern "C" {
     pub fn vfs_get_file_list(handle: u32) -> crate::VfsFileList;
     /// Update the priority of a pending operation.
     pub fn vfs_set_priority(handle: u32, priority: crate::VfsLoadPriority);
-    /// Close a handle and clean up its resources.
+    /// Close a handle and clean up its resources. Never blocks: a handle whose
+    /// operation is still running is cancelled and its ticket, result buffer and read
+    /// callback are reclaimed by a later vfs_update(), once the worker has let go of
+    /// it. The handle stops answering vfs_is_ready and vfs_get_data either way.
     pub fn vfs_close(handle: u32);
     /// Check if a directory listing is still current (its version matches the
     /// current mount version).

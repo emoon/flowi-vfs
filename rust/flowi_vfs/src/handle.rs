@@ -8,7 +8,11 @@
 //!
 //! A [`Handle`] is not Copy and not Clone, and it closes its ticket exactly when
 //! it drops. The close is non-blocking whether or not the operation has finished:
-//! it never polls to completion first. A failed launch is [`None`] rather than an
+//! it never polls to completion first, and the C side frees a ticket it closed
+//! mid-flight from a later frame tick rather than making the drop wait. Anything
+//! the operation still reads has to outlive the handle for that reason - see
+//! [`MappedRead`](crate::MappedRead), whose transform slot is shared with the read
+//! rather than owned by the handle. A failed launch is [`None`] rather than an
 //! in-band handle value, so a live [`Handle`] always holds a real ticket.
 //!
 //! A [`Handle`] is !Send + !Sync by construction (its payload marker is a raw
@@ -86,7 +90,8 @@ impl<T: Payload> Handle<T> {
 
 impl<T: Payload> Drop for Handle<T> {
     fn drop(&mut self) {
-        // Non-blocking close of the C ticket - never a poll-to-completion spin.
+        // Non-blocking close of the C ticket - never a poll-to-completion spin, and
+        // never a wait on the operation behind it either (see the module docs).
         // SAFETY: ticket is our ticket, closed exactly once.
         unsafe { ffi::vfs_close(self.ticket) }
     }

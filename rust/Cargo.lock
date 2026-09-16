@@ -61,6 +61,7 @@ name = "flowi_vfs"
 version = "0.0.0"
 dependencies = [
  "flowi_core",
+ "flowi_core_sys",
  "flowi_vfs_sys",
  "log",
 ]

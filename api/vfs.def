@@ -140,9 +140,10 @@ api Vfs {
 
     /// Check if an async operation is complete (non-blocking).
     vfs_is_ready(handle: u32) -> bool
-    /// Block until an async operation completes. The wait participates in the job
-    /// system - a worker thread that calls it keeps stealing work instead of idling -
-    /// so it is safe from inside a job body. Never call it from the frame loop.
+    /// Block until an async operation completes. Never call it from the frame loop,
+    /// and never from a job body either: the job system refuses to block a worker on
+    /// a job that may itself need a worker, so there the call logs and returns with
+    /// the operation still running.
     vfs_wait(handle: u32)
     /// Get the data from a completed read operation. Call only after vfs_is_ready.
     vfs_get_data(handle: u32) -> VfsData
@@ -151,7 +152,10 @@ api Vfs {
     vfs_get_file_list(handle: u32) -> VfsFileList
     /// Update the priority of a pending operation.
     vfs_set_priority(handle: u32, priority: VfsLoadPriority)
-    /// Close a handle and clean up its resources.
+    /// Close a handle and clean up its resources. Never blocks: a handle whose
+    /// operation is still running is cancelled and its ticket, result buffer and read
+    /// callback are reclaimed by a later vfs_update(), once the worker has let go of
+    /// it. The handle stops answering vfs_is_ready and vfs_get_data either way.
     vfs_close(handle: u32)
 
     /// Check if a directory listing is still current (its version matches the

@@ -120,12 +120,18 @@ void vfs_dispatch(FlVfsHandle handle);
 //
 // Thread contract: fl_jobs_wait() does nothing on a job worker, because blocking one on a job that itself
 // needs a worker can deadlock the pool. A worker can therefore only finish an operation that has already
-// finished, and the calls below fail closed rather than pretend otherwise: vfs_wait() logs and returns,
-// vfs_close() logs and leaves the handle open instead of freeing state the running job still uses, and a
-// read/write chained onto an unfinished predecessor completes with VFS_ERROR_WOULD_BLOCK instead of running
-// against a file that is not open yet. Wait for, close, and chain onto in-flight handles from the main
+// finished, and the calls below fail closed rather than pretend otherwise: vfs_wait() logs and returns, and
+// a read/write chained onto an unfinished predecessor completes with VFS_ERROR_WOULD_BLOCK instead of
+// running against a file that is not open yet. Wait for and chain onto in-flight handles from the main
 // thread. Handles a worker opened itself are unaffected - the job system runs those inline, so they are
 // already finished. vfs_mount_close() and vfs_destroy() are main-thread teardown and are not guarded.
+//
+// vfs_close() is outside that contract because it never waits, on any thread. A handle whose operation has
+// finished is freed on the spot. One still in flight is cancelled and left in the handle map for the
+// main-thread sweep, which frees it on the next vfs_update(), vfs_wait_all() or handle allocation - the
+// running job reaches its handle by pointer, so it keeps working against live state until then. Either way
+// the handle stops answering vfs_is_ready(), vfs_get_data() and every other query the moment close returns,
+// and closing it twice is an error.
 
 
 void vfs_wait_all(void);

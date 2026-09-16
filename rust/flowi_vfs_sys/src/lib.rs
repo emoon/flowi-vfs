@@ -52,14 +52,20 @@ pub use generated::vfs_plugin::{
     VfsWriteResult,
 };
 
-// The two functions the IDL does not describe: vfs_init takes the arena by pointer and
-// vfs_mount_get_job_handle returns a core type, so both are declared by hand here rather
-// than generated. They are exported by the same library as everything above.
+// The three functions the IDL does not describe: vfs_init takes the arena by pointer,
+// vfs_mount_get_job_handle returns a core type, and vfs_update is host plumbing rather than
+// part of the consumer service API. All three are declared by hand here rather than
+// generated. They are exported by the same library as everything above.
 extern "C" {
     /// Bring the VFS singleton up against arena and register the built-in
     /// LocalFS driver (vfs/vfs.h). False when it is already up, or when the job
     /// system has more workers than the VFS supports.
     pub fn vfs_init(arena: *mut Arena) -> bool;
+
+    /// Pump the VFS once per frame from the main thread (vfs/vfs.h): polls the file
+    /// watchers, and frees the handles whose vfs_close landed while their operation
+    /// was still running.
+    pub fn vfs_update();
 
     /// The job the mount's own bring-up runs as (vfs/vfs.h), so work that reads
     /// through the mount can be scheduled after it rather than polled for
