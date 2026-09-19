@@ -728,9 +728,9 @@ bool vfs_tree_try_load_as_archive(VfsState* self, FlVfsMount* mount, VfsTreeNode
     VfsHandles cloned_handles
         = vfs_tree_clone_plugin_handle(mem_plugin.plugin_entry, mem_plugin.plugin_entry->plugin, mem_plugin.handle);
     if (!cloned_handles.handle[0]) {
+        // The plugin owns file_data now and frees it from close(); freeing it here too would be a double free.
         close_plugin_handle(mem_plugin.plugin_entry->plugin, mem_plugin.plugin_entry->plugin_instance,
                             mem_plugin.handle);
-        mi_free(file_data);
         return false;
     }
 
