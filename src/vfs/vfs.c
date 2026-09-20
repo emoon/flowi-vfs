@@ -1311,9 +1311,9 @@ static u64 vfs_snapshot_mount_victims(VfsState* self, FlVfsMount* mount, FlArena
     return count;
 }
 
-// Waits out this mount's in-flight ops before its tree, strings and arena are destroyed. Runs WITHOUT
-// handle_lock, which the jobs themselves take to look their handles up.
-static void vfs_drain_mount_victims(FlVfsMount* mount, const VfsMountVictim* victims, u64 count) {
+// Waits out the jobs the victims currently name, and returns how many of them were still running. Runs
+// WITHOUT handle_lock, which the jobs themselves take to look their handles up.
+static int vfs_wait_victim_jobs(const VfsMountVictim* victims, u64 count) {
     int inflight_jobs = 0;
     for (u64 i = 0; i < count; i++) {
         for (u32 j = 0; j < victims[i].jobs.count; j++) {
@@ -1323,6 +1323,44 @@ static void vfs_drain_mount_victims(FlVfsMount* mount, const VfsMountVictim* vic
                 inflight_jobs++;
             }
         }
+    }
+    return inflight_jobs;
+}
+
+// Re-reads the victims' jobs and reports whether any of them still has work outstanding. A victim whose
+// vfs_dispatch or vfs_chain_file_op was between scheduling a job and recording it contributed no job to the
+// first snapshot - job_handle still read 0 there - so the jobs are re-read rather than trusted once.
+static bool vfs_refresh_mount_victims(VfsState* self, VfsMountVictim* victims, u64 count) {
+    mutex_lock_auto(&self->handle_lock);
+
+    bool outstanding = false;
+    for (u64 i = 0; i < count; i++) {
+        VfsHandleData* handle_data = vfs_lookup_handle_locked(self, victims[i].id);
+        if (!handle_data) {
+            victims[i].jobs = (VfsHandleJobs) { 0 };
+            continue;
+        }
+
+        victims[i].jobs = vfs_handle_jobs(handle_data->job_handle, handle_data->last_job);
+        if (atomic_load_explicit(&handle_data->pending_dispatches, memory_order_acquire) != 0
+            || !vfs_jobs_finished(victims[i].jobs)) {
+            outstanding = true;
+        }
+    }
+
+    return outstanding;
+}
+
+// Waits out this mount's in-flight ops before its tree, strings and arena are destroyed, so no victim is
+// freed below with a job still running against it.
+static void vfs_drain_mount_victims(VfsState* self, FlVfsMount* mount, VfsMountVictim* victims, u64 count) {
+    int inflight_jobs = vfs_wait_victim_jobs(victims, count);
+
+    while (vfs_refresh_mount_victims(self, victims, count)) {
+        inflight_jobs += vfs_wait_victim_jobs(victims, count);
+        // A dispatch still mid-schedule has nothing waitable recorded yet, and fl_jobs_wait blocks only on
+        // the main thread, so this re-read is a poll either way - back off rather than spin on it.
+        sleep_us(100);
     }
 
     if (inflight_jobs > 0) {
@@ -1397,7 +1435,7 @@ void vfs_mount_close(FlVfsMount* mount) {
     u64 victim_count = vfs_snapshot_mount_victims(self, mount, temp.arena, &victims);
     VfsReleaseList releases = vfs_release_list_new(temp.arena, victim_count);
 
-    vfs_drain_mount_victims(mount, victims, victim_count);
+    vfs_drain_mount_victims(self, mount, victims, victim_count);
 
     mutex_lock(&self->handle_lock);
 
