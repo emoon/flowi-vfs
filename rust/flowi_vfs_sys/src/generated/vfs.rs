@@ -71,6 +71,13 @@ pub enum FlVfsMount {}
 /// returns is ignored on that path.
 pub type VfsReadCallback = Option<unsafe extern "C" fn(data: *mut core::ffi::c_void, size: i64, user_data: *mut core::ffi::c_void) -> crate::VfsData>;
 
+/// Optional release hook for a read's user_data. Invoked exactly once, after the
+/// read's job has finished and the callback (if any) has run, when the VFS frees
+/// the handle - which is deferred past vfs_close while the job is still running.
+/// Runs on the thread that frees the handle: the closer's, or the main thread's
+/// vfs_update / vfs_wait_all sweep for a close that was deferred.
+pub type VfsReleaseCallback = Option<unsafe extern "C" fn(user_data: *mut core::ffi::c_void)>;
+
 /// Result of a mount operation: a mount handle plus a detailed status. Check
 /// status == FlVfsMountErrorStatus_Success before using mount.
 #[repr(C)]
@@ -174,7 +181,7 @@ extern "C" {
     /// mount is ready. Returns true if watching was enabled.
     pub fn vfs_mount_enable_watching(mount: *mut FlVfsMount) -> bool;
     /// Read an entire file from within a mount (async). Returns a tracking handle.
-    pub fn vfs_mount_read_all_with_options(mount: *mut FlVfsMount, relative_path: crate::RawStr, callback: crate::VfsReadCallback, user_data: *mut core::ffi::c_void, reuse_handle: u32) -> u32;
+    pub fn vfs_mount_read_all_with_options(mount: *mut FlVfsMount, relative_path: crate::RawStr, callback: crate::VfsReadCallback, user_data: *mut core::ffi::c_void, release: crate::VfsReleaseCallback, reuse_handle: u32) -> u32;
     /// Open a file for reading/writing within a mount. Returns a file handle.
     pub fn vfs_mount_open(mount: *mut FlVfsMount, relative_path: crate::RawStr, flags: u32) -> u32;
     /// Read at most size bytes from an open file into buffer (async, chained

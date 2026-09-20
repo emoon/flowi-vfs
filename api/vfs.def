@@ -97,6 +97,13 @@ struct VfsMountInfo {
 /// returns is ignored on that path.
 callback VfsReadCallback(data: *void, size: i64, user_data: *void) -> VfsData
 
+/// Optional release hook for a read's user_data. Invoked exactly once, after the
+/// read's job has finished and the callback (if any) has run, when the VFS frees
+/// the handle - which is deferred past vfs_close while the job is still running.
+/// Runs on the thread that frees the handle: the closer's, or the main thread's
+/// vfs_update / vfs_wait_all sweep for a close that was deferred.
+callback VfsReleaseCallback(user_data: *void)
+
 /// The `fl_vfs_*` consumer service API - non-blocking virtual filesystem access
 /// exported as plain C symbols the toolkit and plugins call directly. All operations are async: launch
 /// returns a handle, then poll vfs_is_ready before reading the result. Plugins link the shared library and call these symbols directly.
@@ -117,7 +124,7 @@ api Vfs {
     vfs_mount_enable_watching(mount: *FlVfsMount) -> bool
 
     /// Read an entire file from within a mount (async). Returns a tracking handle.
-    vfs_mount_read_all_with_options(mount: *FlVfsMount, relative_path: String, callback: VfsReadCallback, user_data: *void, reuse_handle: u32) -> u32
+    vfs_mount_read_all_with_options(mount: *FlVfsMount, relative_path: String, callback: VfsReadCallback, user_data: *void, release: VfsReleaseCallback, reuse_handle: u32) -> u32
 
     /// Open a file for reading/writing within a mount. Returns a file handle.
     vfs_mount_open(mount: *FlVfsMount, relative_path: String, flags: u32) -> u32

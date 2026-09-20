@@ -152,6 +152,9 @@ struct VfsHandleData {
     // the job and storing its handle. This marks that window so a handle whose job is queued or running is not
     // mistaken for a finished one.
     _Atomic bool dispatch_pending;
+    // Closed while its job was still running. Reads as absent to every caller and is freed by the reclaim
+    // sweep once the job has finished; until then the job keeps its raw pointer. Written under handle_lock.
+    bool closed;
     FlVfsMount* mount;
     FlString path;
     _Atomic(void*) result_data; // Points to FlVfsData, FlVfsFileList, etc. (atomic for thread safety)
@@ -166,6 +169,7 @@ struct VfsHandleData {
     struct FlArena* target_arena; // Target arena for copying data (arena mode) or passing to callback
     FlVfsReadCallback callback;   // Callback for custom processing (callback mode)
     void* user_data;
+    FlVfsReleaseCallback release; // Runs once with user_data when the handle is freed, after its job
 
     FlVfsLoadPriority priority;
 
@@ -228,6 +232,7 @@ typedef struct VfsState {
     pool(FlVfsMount) vfs_mounts;
 
     hashmap(u32, VfsHandleData*) handle_map;
+    u32 closed_count; // Handles in the map with closed set, so the reclaim sweep can skip the walk
 
 } VfsState;
 

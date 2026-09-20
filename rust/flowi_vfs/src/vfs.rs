@@ -90,7 +90,7 @@ pub(crate) mod ffi {
     host_call!(vfs_mount_get_status(mount: *mut sys::FlVfsMount) -> sys::VfsMountStatus);
     host_call!(vfs_mount_get_info(mount: *mut sys::FlVfsMount) -> sys::VfsMountInfo);
     host_call!(vfs_mount_enable_watching(mount: *mut sys::FlVfsMount) -> bool);
-    host_call!(vfs_mount_read_all_with_options(mount: *mut sys::FlVfsMount, path: sys::RawStr, callback: sys::VfsReadCallback, user_data: *mut c_void, reuse: u32) -> u32);
+    host_call!(vfs_mount_read_all_with_options(mount: *mut sys::FlVfsMount, path: sys::RawStr, callback: sys::VfsReadCallback, user_data: *mut c_void, release: sys::VfsReleaseCallback, reuse: u32) -> u32);
     host_call!(vfs_mount_open(mount: *mut sys::FlVfsMount, path: sys::RawStr, flags: u32) -> u32);
     host_call!(vfs_read(ticket: u32, buffer: *mut c_void, size: i64) -> u32);
     host_call!(vfs_get_listing(mount: *mut sys::FlVfsMount, path: sys::RawStr, depth: i32) -> u32);
@@ -129,7 +129,7 @@ pub(crate) mod ffi {
     fake_call!(vfs_mount_get_status(mount: *mut sys::FlVfsMount) -> sys::VfsMountStatus);
     fake_call!(vfs_mount_get_info(mount: *mut sys::FlVfsMount) -> sys::VfsMountInfo);
     fake_call!(vfs_mount_enable_watching(mount: *mut sys::FlVfsMount) -> bool);
-    fake_call!(vfs_mount_read_all_with_options(mount: *mut sys::FlVfsMount, path: sys::RawStr, callback: sys::VfsReadCallback, user_data: *mut c_void, reuse: u32) -> u32);
+    fake_call!(vfs_mount_read_all_with_options(mount: *mut sys::FlVfsMount, path: sys::RawStr, callback: sys::VfsReadCallback, user_data: *mut c_void, release: sys::VfsReleaseCallback, reuse: u32) -> u32);
     fake_call!(vfs_mount_open(mount: *mut sys::FlVfsMount, path: sys::RawStr, flags: u32) -> u32);
     fake_call!(vfs_read(ticket: u32, buffer: *mut c_void, size: i64) -> u32);
     fake_call!(vfs_get_listing(mount: *mut sys::FlVfsMount, path: sys::RawStr, depth: i32) -> u32);
@@ -169,6 +169,7 @@ pub(crate) mod fake {
             sys::RawStr,
             sys::VfsReadCallback,
             *mut c_void,
+            sys::VfsReleaseCallback,
             u32,
         ) -> u32,
         pub(crate) vfs_mount_open:
@@ -204,7 +205,7 @@ pub(crate) mod fake {
         unimplemented_slot!(mount_get_status(a: *mut sys::FlVfsMount) -> sys::VfsMountStatus);
         unimplemented_slot!(mount_get_info(a: *mut sys::FlVfsMount) -> sys::VfsMountInfo);
         unimplemented_slot!(mount_enable_watching(a: *mut sys::FlVfsMount) -> bool);
-        unimplemented_slot!(mount_read_all_with_options(a: *mut sys::FlVfsMount, b: sys::RawStr, c: sys::VfsReadCallback, d: *mut c_void, e: u32) -> u32);
+        unimplemented_slot!(mount_read_all_with_options(a: *mut sys::FlVfsMount, b: sys::RawStr, c: sys::VfsReadCallback, d: *mut c_void, e: sys::VfsReleaseCallback, f: u32) -> u32);
         unimplemented_slot!(mount_open(a: *mut sys::FlVfsMount, b: sys::RawStr, c: u32) -> u32);
         unimplemented_slot!(read(a: u32, b: *mut c_void, c: i64) -> u32);
         unimplemented_slot!(get_listing(a: *mut sys::FlVfsMount, b: sys::RawStr, c: i32) -> u32);
@@ -502,6 +503,7 @@ impl Mount {
                 sys::RawStr::borrow(path),
                 None,
                 ptr::null_mut(),
+                None,
                 FL_VFS_HANDLE_INVALID,
             )
         };
@@ -512,10 +514,10 @@ impl Mount {
     /// worker that completes it, so decode or parse work happens off the frame
     /// loop. The returned [`MappedRead`] polls to whatever transform produced.
     ///
-    /// The transform is an ordinary Rust closure, moved into a slot the returned
-    /// [`MappedRead`] owns, so it is freed whether the read completes, fails, or is
-    /// dropped mid-flight. A panic inside it is caught and surfaced as a failed
-    /// read rather than unwinding across the C boundary.
+    /// The transform is an ordinary Rust closure. It is freed whether the read
+    /// completes, fails, or is dropped mid-flight, and never while the worker can
+    /// still reach it. A panic inside it is caught and surfaced as a failed read
+    /// rather than unwinding across the C boundary.
     ///
     /// Reach for it only when the transform is worth moving off the frame loop;
     /// [`Mount::read`] is the plain-bytes read.
@@ -524,24 +526,28 @@ impl Mount {
         T: Send + 'static,
         F: FnOnce(&[u8]) -> T + Send + 'static,
     {
-        let mut slot = Box::new(MapSlot {
+        let slot = Box::into_raw(Box::new(MapSlot {
             state: Mutex::new(MapState::Pending(Box::new(transform))),
-        });
-        let user_data: *mut c_void = core::ptr::addr_of_mut!(*slot).cast();
-        // SAFETY: a live mount; path is borrowed for the call only. user_data
-        // names the boxed slot, which MappedRead below keeps alive for at least
-        // as long as the ticket - the trampoline is the only other reader, and it
-        // runs before the ticket reports ready.
+        }));
+        // SAFETY: a live mount; path is borrowed for the call only. slot is lent to
+        // the VFS, which runs map_trampoline on it at most once and map_release on
+        // it exactly once when it frees the handle, after the job.
         let ticket = unsafe {
             ffi::vfs_mount_read_all_with_options(
                 self.raw,
                 sys::RawStr::borrow(path),
                 Some(map_trampoline::<T>),
-                user_data,
+                slot.cast(),
+                Some(map_release::<T>),
                 FL_VFS_HANDLE_INVALID,
             )
         };
-        let handle = self.ticket_handle::<Mapped>(ticket)?;
+        let Some(handle) = self.ticket_handle::<Mapped>(ticket) else {
+            // A refused launch minted no handle, so the release hook never runs.
+            // SAFETY: slot is the Box::into_raw above, and the VFS did not take it.
+            drop(unsafe { Box::from_raw(slot) });
+            return None;
+        };
         Some(MappedRead { handle, slot })
     }
 
@@ -694,6 +700,7 @@ impl WorkerMount {
                 sys::RawStr::borrow(path),
                 None,
                 ptr::null_mut(),
+                None,
                 FL_VFS_HANDLE_INVALID,
             );
             self.drain_blocking::<VfsData>(ticket)
@@ -967,9 +974,10 @@ impl Payload for FileList {
 /// The transform's slot: where [`Mount::read_with`] leaves the closure for the
 /// worker, and where the worker leaves the value for the poller.
 ///
-/// The Mutex is not contention control - only one thread ever touches this at a
-/// time - it is the release/acquire pair that publishes the worker's write to the
-/// thread that polls.
+/// Boxed and lent to the VFS as the read's user_data; [`map_release`] is where it
+/// comes back. The Mutex is not contention control - only one thread ever touches
+/// this at a time - it is the release/acquire pair that publishes the worker's
+/// write to the thread that polls.
 struct MapSlot<T> {
     state: Mutex<MapState<T>>,
 }
@@ -1008,9 +1016,8 @@ extern "C" fn map_trampoline<T>(
     if user_data.is_null() {
         return failed(false);
     }
-    // SAFETY: user_data is the `MapSlot<T>` box read_with handed to exactly this
-    // read, kept alive by the MappedRead that owns it; this callback is the only
-    // other reader and the VFS invokes it at most once per read.
+    // SAFETY: user_data is the `MapSlot<T>` box read_with lent to exactly this
+    // read, and the VFS frees it (map_release) only after this callback has run.
     let slot = unsafe { &*user_data.cast::<MapSlot<T>>() };
 
     // Take the closure out before running it, so user code never runs under the
@@ -1043,16 +1050,39 @@ extern "C" fn map_trampoline<T>(
     failed(true)
 }
 
+/// The VfsReleaseCallback [`Mount::read_with`] installs: the VFS runs it exactly
+/// once when it frees the read's handle, after the job, and this frees the slot.
+extern "C" fn map_release<T>(user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: user_data is the `MapSlot<T>` box read_with lent to this read, handed
+    // back exactly once, here.
+    let slot = unsafe { Box::from_raw(user_data.cast::<MapSlot<T>>()) };
+    // A panic must not unwind across this extern "C" boundary; the value or the
+    // transform may carry a panicking Drop.
+    if catch_unwind(AssertUnwindSafe(move || drop(slot))).is_err() {
+        log::error!("VFS read slot panicked while dropping; the rest of it was not dropped");
+    }
+}
+
 /// An in-flight [`Mount::read_with`]: the read's ticket plus the slot its transform
 /// leaves a value in.
 ///
-/// Owning, like [`Handle`]: dropping it closes the C ticket non-blockingly and
-/// frees the transform and any value it produced, whether or not the read ever
-/// completed. Poll it with [`MappedRead::poll`].
+/// Owning, like [`Handle`]: dropping it closes the C ticket non-blockingly. The
+/// transform and any value it produced are freed when the VFS frees the handle -
+/// at the drop for a read that has completed, once the job has run for one dropped
+/// mid-flight. Poll it with [`MappedRead::poll`].
+///
+/// The VFS may also free the handle under a live MappedRead when its mount is
+/// closed. Such a read polls [`Poll::Pending`] from then on, as any [`Handle`]
+/// does, and never touches its slot again.
 pub struct MappedRead<T> {
     handle: Handle<Mapped>,
-    /// Boxed so the address the trampoline was given stays put while this moves.
-    slot: Box<MapSlot<T>>,
+    /// Lent to the VFS and freed by [`map_release`] when the VFS frees the handle.
+    /// Only dereferenced right after vfs_is_ready observed the handle registered,
+    /// which is what proves the slot has not been freed.
+    slot: *mut MapSlot<T>,
 }
 
 impl<T> MappedRead<T> {
@@ -1071,8 +1101,16 @@ impl<T> MappedRead<T> {
     }
 
     /// Take what the transform produced, or the generic error when it left nothing.
+    /// Called only from [`poll`](Self::poll), right after the handle polled ready.
     fn take_value(&mut self) -> Result<T, FlError> {
-        let Ok(mut guard) = self.slot.state.lock() else {
+        // SAFETY: handle.poll just saw vfs_is_ready true, so the VFS held the handle
+        // and had not run map_release. Nothing frees it before this returns: the
+        // reclaim sweep frees closed handles only, and ours is not closed while its
+        // Handle lives; vfs_close on this ticket and vfs_mount_close run only on this
+        // thread, since Handle, Mount and OwnedMount are !Send; and the one call
+        // since the check (vfs_get_data, in Mapped::drain) frees nothing.
+        let slot = unsafe { &*self.slot };
+        let Ok(mut guard) = slot.state.lock() else {
             return Err(FlError::GenericError);
         };
         match core::mem::replace(&mut *guard, MapState::Taken) {
@@ -1172,6 +1210,7 @@ mod tests {
 
     use super::*;
     use core::cell::RefCell;
+    use std::sync::Arc;
 
     /// One entry the fake listing reports.
     #[derive(Clone)]
@@ -1204,8 +1243,11 @@ mod tests {
         mount_null: bool,
         /// How many times vfs_close was called.
         close_count: u32,
-        /// How many times vfs_mount_close was called.
+        /// How many times vfs_mount_close was called. A closed mount also reclaims
+        /// the tracked read the way the real one reaps every handle of the mount,
+        /// and every ticket reads as absent (never ready) from then on.
         mount_close_count: u32,
+        mount_closed: bool,
         /// How many times vfs_wait was called.
         wait_count: u32,
         /// The arena the last vfs_init was handed.
@@ -1219,6 +1261,28 @@ mod tests {
         last_callback_size: i64,
         /// What vfs_mount_get_job_handle reports for the mount.
         mount_job_handle: u64,
+        /// The read-all the fake currently tracks, so the release hook runs when the
+        /// real VFS would: at close for a read whose callback has run, and after the
+        /// callback for one closed while still held.
+        read: Option<FakeRead>,
+    }
+
+    struct FakeRead {
+        callback: sys::VfsReadCallback,
+        release: sys::VfsReleaseCallback,
+        user_data: *mut c_void,
+        callback_ran: bool,
+        closed: bool,
+    }
+
+    impl FakeRead {
+        /// The hand-back the VFS does when it frees the handle.
+        fn release(self) {
+            if let Some(release) = self.release {
+                // SAFETY: user_data is the launch's own pointer, handed back exactly once.
+                unsafe { release(self.user_data) };
+            }
+        }
     }
 
     impl Default for FakeState {
@@ -1234,12 +1298,14 @@ mod tests {
                 mount_null: false,
                 close_count: 0,
                 mount_close_count: 0,
+                mount_closed: false,
                 wait_count: 0,
                 init_arena: core::ptr::null_mut(),
                 prefix: Vec::new(),
                 prefix_requested: 0,
                 last_callback_size: -1,
                 mount_job_handle: 0,
+                read: None,
             }
         }
     }
@@ -1283,7 +1349,14 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_mount_close(_mount: *mut sys::FlVfsMount) {
-        with_fake(|f| f.mount_close_count += 1);
+        let read = with_fake(|f| {
+            f.mount_close_count += 1;
+            f.mount_closed = true;
+            f.read.take()
+        });
+        if let Some(read) = read {
+            read.release();
+        }
     }
 
     unsafe extern "C" fn fake_mount_is_ready(_mount: *mut sys::FlVfsMount) -> bool {
@@ -1312,30 +1385,64 @@ mod tests {
         _path: sys::RawStr,
         callback: sys::VfsReadCallback,
         user_data: *mut c_void,
+        release: sys::VfsReleaseCallback,
         _reuse: u32,
     ) -> u32 {
         if with_fake(|f| f.launch_invalid) {
             return FL_VFS_HANDLE_INVALID;
         }
-        // The real VFS runs the callback on the worker that finished the read, then
-        // publishes the result. The fake runs it inline at launch, which exercises
-        // the same hand-off with the same ordering guarantees; hold_callback
-        // stands in for a read that has not got there yet.
-        match callback {
-            Some(callback) if !with_fake(|f| f.hold_callback) => {
-                let (ptr, size) =
-                    with_fake(|f| (f.data.as_ptr() as *mut c_void, f.data.len() as i64));
-                // SAFETY: ptr/size describe the fake's live buffer; user_data is the
-                // caller's own pointer passed straight back.
-                let result = unsafe { callback(ptr, size, user_data) };
-                with_fake(|f| {
-                    f.last_callback_size = size;
-                    f.fail = !result.success;
-                });
-            }
-            _ => {}
+        with_fake(|f| {
+            assert!(
+                f.read.is_none(),
+                "the fake tracks one read-all at a time; close the previous one first"
+            );
+            f.read = Some(FakeRead {
+                callback,
+                release,
+                user_data,
+                callback_ran: callback.is_none(),
+                closed: false,
+            })
+        });
+        // The real VFS runs the callback on a worker, racing the poller's close. The
+        // fake serialises the two orders: it runs the callback inline at launch, or,
+        // under hold_callback, not until the test runs it after the fact.
+        if callback.is_some() && !with_fake(|f| f.hold_callback) {
+            let (ptr, size) = with_fake(|f| (f.data.as_ptr() as *mut c_void, f.data.len() as i64));
+            run_read_callback(Some((ptr, size)));
         }
         1
+    }
+
+    /// Run the tracked read's callback as the worker does once it reaches the read,
+    /// with (data, size) or with no data for a read that failed; then, if the read
+    /// was already closed, hand its user_data back the way a reclaim would.
+    fn run_read_callback(data: Option<(*mut c_void, i64)>) {
+        let (callback, user_data) = with_fake(|f| {
+            let read = f.read.as_mut().expect("a tracked read");
+            assert!(!read.callback_ran, "the VFS runs a read's callback once");
+            read.callback_ran = true;
+            (
+                read.callback.expect("a read with a callback"),
+                read.user_data,
+            )
+        });
+        let (ptr, size) = data.unwrap_or((ptr::null_mut(), 0));
+        // SAFETY: ptr/size describe a live buffer or the documented no-data form;
+        // user_data is the launch's own pointer passed straight back, exactly once.
+        let result = unsafe { callback(ptr, size, user_data) };
+        with_fake(|f| {
+            f.last_callback_size = size;
+            f.fail = !result.success;
+        });
+        if with_fake(|f| f.read.as_ref().is_some_and(|read| read.closed)) {
+            with_fake(|f| f.read.take()).expect("the read").release();
+        }
+    }
+
+    /// The worker reaching a read launched under hold_callback, after the fact.
+    fn run_held_callback(bytes: Option<&[u8]>) {
+        run_read_callback(bytes.map(|bytes| (bytes.as_ptr() as *mut c_void, bytes.len() as i64)));
     }
 
     unsafe extern "C" fn fake_mount_open(
@@ -1380,6 +1487,9 @@ mod tests {
 
     unsafe extern "C" fn fake_is_ready(_handle: u32) -> bool {
         with_fake(|f| {
+            if f.mount_closed {
+                return false;
+            }
             if f.polls_until_ready > 0 {
                 f.polls_until_ready -= 1;
                 false
@@ -1450,6 +1560,19 @@ mod tests {
 
     unsafe extern "C" fn fake_close(_handle: u32) {
         with_fake(|f| f.close_count += 1);
+        // The tracked read frees at close once its job is done; a close while the
+        // callback is still held defers the free to that callback, as the VFS does.
+        let done = with_fake(|f| match f.read.as_mut() {
+            Some(read) if read.callback_ran => f.read.take(),
+            Some(read) => {
+                read.closed = true;
+                None
+            }
+            None => None,
+        });
+        if let Some(read) = done {
+            read.release();
+        }
     }
 
     // The struct-update tail is redundant today (the list below covers every slot), but it is what makes a
@@ -1832,6 +1955,30 @@ mod tests {
         assert_eq!(with_fake(|f| f.close_count), 1);
     }
 
+    /// A completed read dropped without being polled still holds the value the
+    /// transform produced; the close hands the slot back and frees it, value and all.
+    #[test]
+    fn a_completed_reads_slot_is_freed_at_its_close() {
+        reset_fake(FakeState {
+            data: b"x".to_vec(),
+            ..Default::default()
+        });
+        let mount = Vfs::mount("/data").expect("mount");
+        let witness = Arc::new(());
+        let produced = Arc::clone(&witness);
+        let read = mount
+            .read_with("list.txt", move |_bytes| produced)
+            .expect("launch");
+        assert_eq!(
+            Arc::strong_count(&witness),
+            2,
+            "the slot holds the value the transform produced"
+        );
+        drop(read);
+        assert_eq!(Arc::strong_count(&witness), 1, "the close freed the slot");
+        assert_eq!(with_fake(|f| f.close_count), 1);
+    }
+
     #[test]
     fn read_with_reports_a_panicking_transform_as_a_failed_read() {
         reset_fake(FakeState {
@@ -1845,8 +1992,11 @@ mod tests {
         assert_eq!(read.poll(), Poll::Ready(Err(FlError::GenericError)));
     }
 
+    /// A read dropped before the worker reached it: the close is non-blocking, so
+    /// the transform - and the slot it lives in - must outlive the drop for as long
+    /// as the worker can still call back, and be freed by that callback.
     #[test]
-    fn read_with_dropped_mid_flight_frees_its_slot_and_closes() {
+    fn read_with_dropped_mid_flight_keeps_its_slot_until_the_worker_lets_go() {
         reset_fake(FakeState {
             polls_until_ready: i32::MAX,
             hold_callback: true,
@@ -1854,20 +2004,111 @@ mod tests {
             ..Default::default()
         });
         let mount = Vfs::mount("/data").expect("mount");
-        // The transform captures an Arc, so the strong count proves the closure
-        // (and with it the slot) was freed rather than leaked.
-        let witness = std::sync::Arc::new(());
-        let captured = std::sync::Arc::clone(&witness);
+        // The transform captures an Arc, so the strong count proves when the closure
+        // (and with it the slot) is freed.
+        let witness = Arc::new(());
+        let captured = Arc::clone(&witness);
         let mut read = mount
             .read_with("slow.txt", move |_bytes| {
                 let _ = &captured;
             })
             .expect("launch");
         assert!(matches!(read.poll(), Poll::Pending));
-        assert_eq!(std::sync::Arc::strong_count(&witness), 2);
+        assert_eq!(Arc::strong_count(&witness), 2);
+
         drop(read);
-        assert_eq!(std::sync::Arc::strong_count(&witness), 1);
         assert_eq!(with_fake(|f| f.close_count), 1);
+        assert_eq!(
+            Arc::strong_count(&witness),
+            2,
+            "the slot outlives the dropped read while the worker can still reach it"
+        );
+
+        // The worker gets there and reports the read failed (no data): that hand-off
+        // is what frees the transform.
+        run_held_callback(None);
+        assert_eq!(Arc::strong_count(&witness), 1);
+    }
+
+    /// The other order the race can settle in: the worker completes a read whose
+    /// poller has already dropped it. The transform runs on the bytes, its value has
+    /// no reader, and the slot is freed - not touched after free.
+    #[test]
+    fn read_with_dropped_mid_flight_survives_the_worker_completing_it() {
+        reset_fake(FakeState {
+            polls_until_ready: i32::MAX,
+            hold_callback: true,
+            ..Default::default()
+        });
+        let mount = Vfs::mount("/data").expect("mount");
+        let witness = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::clone(&witness);
+        let read = mount
+            .read_with("slow.txt", move |bytes| {
+                captured.store(bytes.len(), std::sync::atomic::Ordering::Release);
+            })
+            .expect("launch");
+        drop(read);
+        assert_eq!(Arc::strong_count(&witness), 2);
+
+        run_held_callback(Some(b"late"));
+        assert_eq!(
+            witness.load(std::sync::atomic::Ordering::Acquire),
+            4,
+            "the transform ran on the completed read's bytes"
+        );
+        assert_eq!(Arc::strong_count(&witness), 1);
+    }
+
+    /// A mount closed under a live read frees the read's handle, slot included:
+    /// the read must then poll Pending for good rather than reach the freed slot.
+    #[test]
+    fn a_mapped_read_outliving_its_mount_polls_pending_and_frees_its_slot_once() {
+        reset_fake(FakeState {
+            polls_until_ready: i32::MAX,
+            hold_callback: true,
+            ..Default::default()
+        });
+        let mount = Vfs::mount("/data").expect("mount");
+        let witness = Arc::new(());
+        let captured = Arc::clone(&witness);
+        let mut read = mount
+            .read_with("slow.txt", move |_bytes| {
+                let _ = &captured;
+            })
+            .expect("launch");
+        assert!(matches!(read.poll(), Poll::Pending));
+
+        drop(mount);
+        assert_eq!(
+            Arc::strong_count(&witness),
+            1,
+            "the mount's teardown freed the slot"
+        );
+        assert!(matches!(read.poll(), Poll::Pending));
+        assert!(matches!(read.poll(), Poll::Pending));
+
+        drop(read);
+        assert_eq!(with_fake(|f| f.close_count), 1);
+    }
+
+    /// A launch the C side refuses never reaches the callback, so the reference
+    /// handed to it has to come back rather than leak.
+    #[test]
+    fn read_with_refused_launch_frees_the_slot() {
+        reset_fake(FakeState {
+            launch_invalid: true,
+            ..Default::default()
+        });
+        let mount = Vfs::mount("/data").expect("mount");
+        let witness = Arc::new(());
+        let captured = Arc::clone(&witness);
+        assert!(mount
+            .read_with("nope.txt", move |_bytes| {
+                let _ = &captured;
+            })
+            .is_none());
+        assert_eq!(Arc::strong_count(&witness), 1);
     }
 
     #[test]

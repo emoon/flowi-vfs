@@ -74,46 +74,42 @@ void vfs_destroy(void);
 // for filesystem changes. Call once per frame to advance async I/O.
 void vfs_update(void);
 
-
 // Convenience macro for mounting with default options
 #define vfs_mount(source_path) vfs_mount_with_options(source_path, (FlVfsMountOptions) { 0 })
 
-
 // Returns 0 if the mount completed synchronously or mount is null
 FlJobHandle vfs_mount_get_job_handle(FlVfsMount* mount);
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 typedef struct VfsReadOptions {
     FlVfsReadCallback callback;
     void* user_data;
-    FlVfsHandle reuse_handle; // Handle to reuse (or FL_VFS_HANDLE_INVALID/0)
+    FlVfsReleaseCallback release; // Runs once with user_data when the handle is freed (see FlVfsReleaseCallback)
+    FlVfsHandle reuse_handle;     // Handle to reuse (or FL_VFS_HANDLE_INVALID/0)
 } VfsReadOptions;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // File Operations on Mounts
 
-
 // Get size of an open file (synchronous)
 // Returns: Size result with file size (negative on error)
 FlVfsSizeResult vfs_get_size(FlVfsHandle file_handle);
 
-
 // Two-phase read: allocate handle without dispatching the job.
 // Must be followed by vfs_dispatch() to actually start the operation.
 FlVfsHandle vfs_mount_read_all_prepare(FlVfsMount* mount, FlString relative_path, FlVfsReadCallback callback,
-                                       void* user_data, FlVfsHandle reuse_handle);
+                                       void* user_data, FlVfsReleaseCallback release, FlVfsHandle reuse_handle);
 
 // Dispatch a previously prepared handle (from vfs_mount_read_all_prepare).
 void vfs_dispatch(FlVfsHandle handle);
 
-#define vfs_mount_read_all(mount, path, ...)                                                               \
-    ({                                                                                                     \
-        VfsReadOptions _opts = { __VA_ARGS__ };                                                            \
-        vfs_mount_read_all_with_options(mount, path, _opts.callback, _opts.user_data, _opts.reuse_handle); \
+#define vfs_mount_read_all(mount, path, ...)                                                         \
+    ({                                                                                               \
+        VfsReadOptions _opts = { __VA_ARGS__ };                                                      \
+        vfs_mount_read_all_with_options(mount, path, _opts.callback, _opts.user_data, _opts.release, \
+                                        _opts.reuse_handle);                                         \
     })
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Handle Operations
@@ -126,7 +122,14 @@ void vfs_dispatch(FlVfsHandle handle);
 // against a file that is not open yet. Wait for, close, and chain onto in-flight handles from the main
 // thread. Handles a worker opened itself are unaffected - the job system runs those inline, so they are
 // already finished. vfs_mount_close() and vfs_destroy() are main-thread teardown and are not guarded.
-
+//
+// vfs_close() never waits on the main thread either. Closing a handle whose job is still running marks it
+// closed: it reads as absent from then on, its id is not recycled, and the VFS frees it once the job has
+// finished - from vfs_update(), vfs_wait_all() or a later vfs_close(). The job itself runs to completion, so
+// a read-all's user_data must stay valid past the close; the read's release hook is what tells its owner when
+// it may go. The exception is a handle from vfs_read() / vfs_write() / vfs_write_no_copy(): those run
+// against memory the caller lent for the op and closing one is the caller's signal that the memory may go, so
+// that close waits for the op first (and is refused on a worker, as above).
 
 void vfs_wait_all(void);
 
@@ -134,9 +137,7 @@ void vfs_wait_all(void);
 // Note: From worker threads, this schedules immediately (VFS ops are sync there)
 FlJobHandle vfs_schedule_job(FlVfsHandle handle, FlJobsFunc func, void* user_data);
 
-
 VfsOpStatus vfs_get_status(FlVfsHandle handle);
-
 
 // Note: This is cooperative cancellation - the operation will check for cancellation
 //       at strategic points and bail out gracefully. The handle must still be closed
@@ -148,10 +149,8 @@ bool vfs_cancel(FlVfsHandle handle);
 
 void vfs_dump_tree(FlVfsMount* mount);
 
-
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Fuzzy filtering
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 

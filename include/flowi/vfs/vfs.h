@@ -75,6 +75,13 @@ typedef struct FlVfsData {
 // returns is ignored on that path.
 typedef FlVfsData (*FlVfsReadCallback)(void* data, int64_t size, void* user_data);
 
+// Optional release hook for a read's user_data. Invoked exactly once, after the
+// read's job has finished and the callback (if any) has run, when the VFS frees
+// the handle - which is deferred past vfs_close while the job is still running.
+// Runs on the thread that frees the handle: the closer's, or the main thread's
+// vfs_update / vfs_wait_all sweep for a close that was deferred.
+typedef void (*FlVfsReleaseCallback)(void* user_data);
+
 // Result of a mount operation: a mount handle plus a detailed status. Check
 // status == FlVfsMountErrorStatus_Success before using mount.
 typedef struct FlVfsMountResult {
@@ -127,7 +134,7 @@ FL_API void vfs_mount_close(FlVfsMount* mount);
 // mount is ready. Returns true if watching was enabled.
 FL_API bool vfs_mount_enable_watching(FlVfsMount* mount);
 // Read an entire file from within a mount (async). Returns a tracking handle.
-FL_API uint32_t vfs_mount_read_all_with_options(FlVfsMount* mount, FlString relative_path, FlVfsReadCallback callback, void* user_data, uint32_t reuse_handle);
+FL_API uint32_t vfs_mount_read_all_with_options(FlVfsMount* mount, FlString relative_path, FlVfsReadCallback callback, void* user_data, FlVfsReleaseCallback release, uint32_t reuse_handle);
 // Open a file for reading/writing within a mount. Returns a file handle.
 FL_API uint32_t vfs_mount_open(FlVfsMount* mount, FlString relative_path, uint32_t flags);
 // Read at most size bytes from an open file into buffer (async, chained

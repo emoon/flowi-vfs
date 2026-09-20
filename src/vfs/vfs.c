@@ -38,13 +38,22 @@ const FlVfsEntry fl_nil_vfs_entry = { 0 };
 
 FlString vfs_format_error_message(FlArena* scratch, const char* fmt, ...);
 void vfs_free_error_message(VfsState* self, FlString error_message);
+static void vfs_reclaim_closed_handles(VfsState* self);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Caller must hold handle_lock.
+// Caller must hold handle_lock. Finds a closed-but-unreclaimed handle too: vfs_close() and the reclaim sweep
+// need to see it, and a chained op reaches its file handle through it.
 static inline VfsHandleData* vfs_lookup_handle_locked(VfsState* self, FlVfsHandle handle) {
     VfsHandleData** handle_ptr = hashmap_get(&self->handle_map, handle);
     return (handle_ptr && *handle_ptr) ? *handle_ptr : nullptr;
+}
+
+// Caller must hold handle_lock. The lookup every caller-facing entry point uses: a handle closed while its job
+// was still running reads as absent.
+static inline VfsHandleData* vfs_lookup_open_handle_locked(VfsState* self, FlVfsHandle handle) {
+    VfsHandleData* handle_data = vfs_lookup_handle_locked(self, handle);
+    return (handle_data && !handle_data->closed) ? handle_data : nullptr;
 }
 
 // Value-copy of the handle fields non-job callers need, taken under handle_lock so a concurrent vfs_close
@@ -87,15 +96,22 @@ static VfsHandleJobs vfs_handle_jobs(FlJobHandle job_handle, FlJobHandle last_jo
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static bool vfs_jobs_finished(VfsHandleJobs jobs) {
+    for (u32 i = 0; i < jobs.count; ++i) {
+        if (fl_jobs_is_finished(jobs.handles[i]) == FlJobsResult_NotFinished) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Returns false if a job is still running afterwards: fl_jobs_wait() is a no-op on a job worker, so a
 // caller that would free the handle on the strength of the wait must bail instead.
 static bool vfs_wait_handle_jobs(VfsHandleJobs jobs) {
-    bool finished = true;
     for (u32 i = 0; i < jobs.count; ++i) {
         fl_jobs_wait(jobs.handles[i]);
-        finished = finished && fl_jobs_is_finished(jobs.handles[i]) != FlJobsResult_NotFinished;
     }
-    return finished;
+    return vfs_jobs_finished(jobs);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -114,7 +130,7 @@ static bool vfs_snapshot_handle(FlVfsHandle handle, VfsHandleSnapshot* out) {
     }
 
     mutex_lock_auto(&self->handle_lock);
-    VfsHandleData* handle_data = vfs_lookup_handle_locked(self, handle);
+    VfsHandleData* handle_data = vfs_lookup_open_handle_locked(self, handle);
     if (!handle_data) {
         return false;
     }
@@ -290,7 +306,8 @@ void vfs_register_driver(const FlVfsPlugin* plugin, void* instance) {
 // runs, the handle is private to the calling thread, so field writes need no lock. Callers finish op-specific
 // setup (and job scheduling) on the private handle, then publish as the last step.
 static VfsHandleData* allocate_handle(VfsState* self, FlVfsMount* mount, FlString path, VfsOperationType op_type,
-                                      FlVfsReadCallback callback, void* user_data, FlVfsHandle reuse_handle) {
+                                      FlVfsReadCallback callback, void* user_data, FlVfsReleaseCallback release,
+                                      FlVfsHandle reuse_handle) {
     FL_VALIDATE_RET(self != nullptr, nullptr);
 
     // handle_lock protects the pool, next_handle_id, and the reuse check
@@ -323,6 +340,7 @@ static VfsHandleData* allocate_handle(VfsState* self, FlVfsMount* mount, FlStrin
     handle->op_type = op_type;
     handle->callback = callback;
     handle->user_data = user_data;
+    handle->release = release;
     handle->result_arena = nullptr; // Will be set for list operations
     handle->job_handle = 0;
     handle->priority = FlVfsLoadPriority_Normal;
@@ -349,9 +367,10 @@ static void vfs_publish_handle(VfsState* self, VfsHandleData* handle) {
 
 static FlVfsHandle allocate_op_ex(VfsState* self, FlVfsMount* mount, FlString path, VfsOperationType op, int depth,
                                   struct FlArena* target_arena, FlVfsReadCallback callback, void* user_data,
-                                  FlVfsHandle reuse_handle, FlString filter_needle, u32 open_flags) {
+                                  FlVfsReleaseCallback release, FlVfsHandle reuse_handle, FlString filter_needle,
+                                  u32 open_flags) {
 
-    VfsHandleData* handle = allocate_handle(self, mount, path, op, callback, user_data, reuse_handle);
+    VfsHandleData* handle = allocate_handle(self, mount, path, op, callback, user_data, release, reuse_handle);
 
     FL_VALIDATE_RET(handle != nullptr, FL_VFS_HANDLE_INVALID);
 
@@ -378,9 +397,9 @@ static FlVfsHandle allocate_op_ex(VfsState* self, FlVfsMount* mount, FlString pa
 
 static FlVfsHandle allocate_op(VfsState* self, FlVfsMount* mount, FlString path, VfsOperationType op, int depth,
                                struct FlArena* target_arena, FlVfsReadCallback callback, void* user_data,
-                               FlVfsHandle reuse_handle, FlString filter_needle) {
-    return allocate_op_ex(self, mount, path, op, depth, target_arena, callback, user_data, reuse_handle, filter_needle,
-                          0);
+                               FlVfsReleaseCallback release, FlVfsHandle reuse_handle, FlString filter_needle) {
+    return allocate_op_ex(self, mount, path, op, depth, target_arena, callback, user_data, release, reuse_handle,
+                          filter_needle, 0);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -427,7 +446,7 @@ FlVfsMountResult vfs_mount_with_options(FlString source_path, FlVfsMountOptions 
     mount->root_node->is_directory = true;
 
     VfsHandleData* handle
-        = allocate_handle(self, mount, source_path, VfsOp_Mount, nullptr, nullptr, FL_VFS_HANDLE_INVALID);
+        = allocate_handle(self, mount, source_path, VfsOp_Mount, nullptr, nullptr, nullptr, FL_VFS_HANDLE_INVALID);
 
     mount->source_path = string_allocator_copy(mount->strings, source_path);
 
@@ -476,10 +495,9 @@ void vfs_set_priority(FlVfsHandle handle, FlVfsLoadPriority priority) {
     // The lock covers the lookup and every handle_data access, guarding against a concurrent vfs_close.
     // fl_jobs_set_priority is atomics-only and never blocks, so it is safe to call under it.
     mutex_lock_auto(&self->handle_lock);
-    VfsHandleData** handle_ptr = hashmap_get(&self->handle_map, handle);
+    VfsHandleData* handle_data = vfs_lookup_open_handle_locked(self, handle);
 
-    if (handle_ptr && *handle_ptr) {
-        VfsHandleData* handle_data = *handle_ptr;
+    if (handle_data) {
         handle_data->priority = priority;
 
         if (handle_data->job_handle) {
@@ -499,7 +517,7 @@ FlVfsDirHandle vfs_get_listing_filtered(FlVfsMount* mount, FlString relative_pat
 
     FL_VALIDATE_LOG(mount != nullptr, FL_VFS_DIR_HANDLE_INVALID, logc_error(VFS_ID, "Invalid mount for get_listing"));
 
-    return allocate_op(g_vfs_state, mount, relative_path, VfsOp_MountList, depth, nullptr, nullptr, nullptr,
+    return allocate_op(g_vfs_state, mount, relative_path, VfsOp_MountList, depth, nullptr, nullptr, nullptr, nullptr,
                        FL_VFS_HANDLE_INVALID, filter_needle);
 }
 
@@ -551,8 +569,8 @@ void vfs_wait_all(void) {
     FL_VALIDATE(self != nullptr);
 
     // Snapshot the jobs while the map is stable, then wait without handle_lock: jobs may need that lock to
-    // finish, and vfs_close waits outside it for the same reason. Handles published after this snapshot belong
-    // to a later wait_all call. Two slots per handle: its open job, and whatever was chained onto that after.
+    // finish. Handles published after this snapshot belong to a later wait_all call. Two slots per handle:
+    // its open job, and whatever was chained onto that after.
     arena_scratch_auto(temp);
     mutex_lock(&self->handle_lock);
     u64 handle_count = hashmap_count(&self->handle_map);
@@ -569,6 +587,8 @@ void vfs_wait_all(void) {
     for (u64 i = 0; i < job_count; ++i) {
         fl_jobs_wait(jobs[i]);
     }
+
+    vfs_reclaim_closed_handles(self);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -745,6 +765,73 @@ static void vfs_free_handle_resources(VfsState* self, VfsHandleData* handle_data
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // VFS close
 
+// A read-all's release hook and its argument, taken off the handle at free time and run once handle_lock is
+// released: the hook is caller code, and one that reaches back into the VFS would deadlock on the lock.
+typedef struct VfsRelease {
+    FlVfsReleaseCallback fn;
+    void* user_data;
+} VfsRelease;
+
+static void vfs_run_release(VfsRelease release) {
+    if (release.fn) {
+        release.fn(release.user_data);
+    }
+}
+
+// Caller holds handle_lock and runs the returned release after letting it go. A chained read/write handle
+// references a file_handle but never owns it, and a VfsOp_ReadAll handle has no chained file handle at all,
+// so no free here recurses into another handle.
+static VfsRelease vfs_free_handle_locked(VfsState* self, VfsHandleData* handle_data) {
+    VfsRelease release = { .fn = handle_data->release, .user_data = handle_data->user_data };
+    if (handle_data->closed) {
+        self->closed_count--;
+    }
+    vfs_free_handle_resources(self, handle_data);
+    hashmap_remove(&self->handle_map, handle_data->id);
+    pool_free(&self->handle_pool, handle_data);
+    return release;
+}
+
+// Frees every handle that was closed while its job was still running and whose jobs have finished since. A
+// closed handle stays in the map until then, so its id is neither reachable nor recycled and the job keeps
+// its raw pointer.
+static void vfs_reclaim_closed_handles(VfsState* self) {
+    mutex_lock(&self->handle_lock);
+    if (self->closed_count == 0) {
+        mutex_unlock(&self->handle_lock);
+        return;
+    }
+
+    arena_scratch_auto(temp);
+    VfsHandleData** done = arena_alloc_array(temp.arena, VfsHandleData*, self->closed_count);
+    VfsRelease* releases = arena_alloc_array(temp.arena, VfsRelease, self->closed_count);
+    u32 done_count = 0;
+    for_each_hashmap(&self->handle_map, key, val) {
+        (void)key;
+        VfsHandleData* hd = *val;
+        if (hd && hd->closed && !atomic_load_explicit(&hd->dispatch_pending, memory_order_acquire)
+            && vfs_jobs_finished(vfs_handle_jobs(hd->job_handle, hd->last_job))) {
+            done[done_count++] = hd;
+        }
+    }
+
+    // Removal after the walk: hashmap_remove unlinks the node for_each_hashmap is standing on.
+    for (u32 i = 0; i < done_count; ++i) {
+        releases[i] = vfs_free_handle_locked(self, done[i]);
+    }
+    mutex_unlock(&self->handle_lock);
+
+    for (u32 i = 0; i < done_count; ++i) {
+        vfs_run_release(releases[i]);
+    }
+}
+
+// The ops that run against memory the caller lent for their duration: vfs_read's buffer and the data of
+// vfs_write_no_copy. vfs_write's copy is VFS-owned, but the two writes are not told apart here.
+static bool vfs_op_borrows_caller_memory(VfsOperationType op_type) {
+    return op_type == VfsOp_FileRead || op_type == VfsOp_FileWrite;
+}
+
 void vfs_close(FlVfsHandle handle) {
     profile_function_auto_nc("vfs:vfs_close", PROFILE_COLOR_CYAN);
     VfsState* self = g_vfs_state;
@@ -753,52 +840,68 @@ void vfs_close(FlVfsHandle handle) {
         return;
     }
 
-    // Wait for pending operations BEFORE taking handle_lock: the wait blocks until the job runs, and the
-    // job looks up its handle under that same lock. last_job covers the reads and writes chained onto a
-    // file handle, which still dereference it on their worker.
+    vfs_reclaim_closed_handles(self);
+
     VfsHandleSnapshot snap;
     if (!vfs_snapshot_handle(handle, &snap)) {
         return;
     }
 
-    // On a job worker the wait does nothing, so a job unfinished here stays unfinished. Freeing now would
-    // pull VfsHandleData, the result buffer and the plugin file handle out from under the running job.
-    // A pending dispatch is the same refusal for a different reason: the job is already scheduled and its
-    // handle is not stored yet, so there is nothing here to wait on and freeing would race the job.
-    if (!vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job)) || snap.dispatch_pending) {
-        logc_error(VFS_ID,
-                   "vfs_close(%u) from a job worker cannot wait out the running operation; the handle stays "
-                   "open. Close an in-flight handle from the main thread.",
-                   handle);
-        return;
+    // Closing an op that borrows the caller's memory is the caller's signal that the memory may go, so it
+    // cannot be deferred: wait first. The wait runs without handle_lock, which the job takes to look its
+    // file handle up. last_job covers the reads and writes chained onto a file handle.
+    bool borrows_caller_memory = vfs_op_borrows_caller_memory(snap.op_type);
+    if (borrows_caller_memory) {
+        vfs_wait_handle_jobs(vfs_handle_jobs(snap.job_handle, snap.last_job));
     }
 
     mutex_lock(&self->handle_lock);
 
-    // Re-look up under the lock: the job wait ran without it, so validate the
-    // handle still exists (a concurrent close may have removed it).
-    VfsHandleData* handle_data = vfs_lookup_handle_locked(self, handle);
+    // Re-look up under the lock: the snapshot and wait ran without it, and a concurrent close may have
+    // taken the handle already.
+    VfsHandleData* handle_data = vfs_lookup_open_handle_locked(self, handle);
     if (!handle_data) {
         mutex_unlock(&self->handle_lock);
         return;
     }
 
-    // Freeing a handle whose job is still running would be a use-after-free in the worker; a job scheduled
-    // on this handle after the waits above means the caller raced close against issuing an op.
-    FL_ASSERT_DEBUG(handle_data->job_handle == 0
-                    || fl_jobs_is_finished(handle_data->job_handle) != FlJobsResult_NotFinished);
-    FL_ASSERT_DEBUG(handle_data->last_job == 0
-                    || fl_jobs_is_finished(handle_data->last_job) != FlJobsResult_NotFinished);
+    // A pending dispatch has its job scheduled and its handle not stored yet, so it counts as running.
+    bool finished = !atomic_load_explicit(&handle_data->dispatch_pending, memory_order_acquire)
+                    && vfs_jobs_finished(vfs_handle_jobs(handle_data->job_handle, handle_data->last_job));
 
-    // A chained read/write handle references a file_handle but never owns it, and a VfsOp_ReadAll handle
-    // has no chained file handle at all, so no close here recurses into another handle. The lock is
-    // therefore held across the whole teardown.
-    vfs_free_handle_resources(self, handle_data);
+    if (!finished) {
+        // On a job worker the wait above did nothing, and a borrowing op cannot be deferred on any thread:
+        // freeing now would pull VfsHandleData, the result buffer and the plugin file handle out from
+        // under the running job. Both refuse and leave the handle open.
+        if (!fl_jobs_is_main_thread()) {
+            mutex_unlock(&self->handle_lock);
+            logc_error(VFS_ID,
+                       "vfs_close(%u) from a job worker cannot wait out the running operation; the handle stays "
+                       "open. Close an in-flight handle from the main thread.",
+                       handle);
+            return;
+        }
+        if (borrows_caller_memory) {
+            mutex_unlock(&self->handle_lock);
+            logc_error(VFS_ID,
+                       "vfs_close(%u): a read or write into caller memory was scheduled after the close began; "
+                       "the handle stays open. Wait for it and close again.",
+                       handle);
+            return;
+        }
 
-    hashmap_remove(&self->handle_map, handle);
-    pool_free(&self->handle_pool, handle_data);
+        // Deferred: the job finishes on its own, uncancelled, and the reclaim sweep frees the handle after.
+        handle_data->closed = true;
+        self->closed_count++;
+        mutex_unlock(&self->handle_lock);
+        return;
+    }
+
+    VfsRelease release = vfs_free_handle_locked(self, handle_data);
 
     mutex_unlock(&self->handle_lock);
+
+    vfs_run_release(release);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -814,7 +917,7 @@ bool vfs_cancel(FlVfsHandle handle) {
     // The store must happen under the lock: a concurrent vfs_close could otherwise free the struct
     // between lookup and store
     mutex_lock_auto(&self->handle_lock);
-    VfsHandleData* handle_data = vfs_lookup_handle_locked(self, handle);
+    VfsHandleData* handle_data = vfs_lookup_open_handle_locked(self, handle);
 
     if (!handle_data) {
         return false;
@@ -828,22 +931,22 @@ bool vfs_cancel(FlVfsHandle handle) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 FlVfsHandle vfs_mount_read_all_with_options(FlVfsMount* mount, FlString relative_path, FlVfsReadCallback callback,
-                                            void* user_data, FlVfsHandle reuse_handle) {
+                                            void* user_data, FlVfsReleaseCallback release, FlVfsHandle reuse_handle) {
     FL_VALIDATE_RET(mount != nullptr, FL_VFS_HANDLE_INVALID);
 
-    return allocate_op(g_vfs_state, mount, relative_path, VfsOp_ReadAll, 0, nullptr, callback, user_data, reuse_handle,
-                       (FlString) { 0 });
+    return allocate_op(g_vfs_state, mount, relative_path, VfsOp_ReadAll, 0, nullptr, callback, user_data, release,
+                       reuse_handle, (FlString) { 0 });
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Two-phase read: allocate handle first, dispatch later.
 
 FlVfsHandle vfs_mount_read_all_prepare(FlVfsMount* mount, FlString relative_path, FlVfsReadCallback callback,
-                                       void* user_data, FlVfsHandle reuse_handle) {
+                                       void* user_data, FlVfsReleaseCallback release, FlVfsHandle reuse_handle) {
     FL_VALIDATE_RET(mount != nullptr, FL_VFS_HANDLE_INVALID);
 
     VfsHandleData* handle
-        = allocate_handle(g_vfs_state, mount, relative_path, VfsOp_ReadAll, callback, user_data, reuse_handle);
+        = allocate_handle(g_vfs_state, mount, relative_path, VfsOp_ReadAll, callback, user_data, release, reuse_handle);
     FL_VALIDATE_RET(handle != nullptr, FL_VFS_HANDLE_INVALID);
 
     FlVfsHandle id = handle->id;
@@ -862,7 +965,7 @@ void vfs_dispatch(FlVfsHandle handle) {
     }
 
     mutex_lock(&self->handle_lock);
-    VfsHandleData* handle_data = vfs_lookup_handle_locked(self, handle);
+    VfsHandleData* handle_data = vfs_lookup_open_handle_locked(self, handle);
     FlVfsMount* mount = handle_data ? handle_data->mount : nullptr;
     if (handle_data) {
         // Before scheduling: the worker can reach the job, and a caller can observe the handle, while
@@ -893,7 +996,7 @@ void vfs_dispatch(FlVfsHandle handle) {
 FlVfsHandle vfs_mount_open(FlVfsMount* mount, FlString relative_path, u32 flags) {
     FL_VALIDATE_RET(mount != nullptr, FL_VFS_HANDLE_INVALID);
 
-    return allocate_op_ex(g_vfs_state, mount, relative_path, VfsOp_FileOpen, 0, nullptr, nullptr, nullptr,
+    return allocate_op_ex(g_vfs_state, mount, relative_path, VfsOp_FileOpen, 0, nullptr, nullptr, nullptr, nullptr,
                           FL_VFS_HANDLE_INVALID, (FlString) { 0 }, flags);
 }
 
@@ -949,7 +1052,7 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
 
     mutex_lock(&self->handle_lock);
 
-    VfsHandleData* file_data = vfs_lookup_handle_locked(self, file_handle);
+    VfsHandleData* file_data = vfs_lookup_open_handle_locked(self, file_handle);
     if (!file_data || file_data->op_type != VfsOp_FileOpen) {
         mutex_unlock(&self->handle_lock);
         logc_error(VFS_ID, "Invalid file handle for %s operation", op_name);
@@ -1096,6 +1199,7 @@ void vfs_mount_close(FlVfsMount* mount) {
     u64 map_count = hashmap_count(&self->handle_map);
     FlVfsHandle* victims = arena_alloc_array(temp.arena, FlVfsHandle, map_count);
     VfsHandleJobs* victim_jobs = arena_alloc_array(temp.arena, VfsHandleJobs, map_count);
+    VfsRelease* releases = arena_alloc_array(temp.arena, VfsRelease, map_count);
     u64 victim_count = 0;
     for_each_hashmap(&self->handle_map, key, val) {
         VfsHandleData* hd = *val;
@@ -1140,11 +1244,7 @@ void vfs_mount_close(FlVfsMount* mount) {
     for (u64 i = 0; i < victim_count; i++) {
         VfsHandleData** victim_ptr = hashmap_get(&self->handle_map, victims[i]);
         VfsHandleData* victim_data = victim_ptr ? *victim_ptr : nullptr;
-        if (victim_data) {
-            vfs_free_handle_resources(self, victim_data);
-            pool_free(&self->handle_pool, victim_data);
-        }
-        hashmap_remove(&self->handle_map, victims[i]);
+        releases[i] = victim_data ? vfs_free_handle_locked(self, victim_data) : (VfsRelease) { 0 };
     }
 
     if (mount->watching_enabled && mount->watcher_handle != 0) {
@@ -1184,6 +1284,10 @@ void vfs_mount_close(FlVfsMount* mount) {
     // Release handle_lock before acquiring mount_lock to maintain lock ordering
     // (vfs_mount_with_options acquires mount_lock -> handle_lock, so we must respect that order)
     mutex_unlock(&self->handle_lock);
+
+    for (u64 i = 0; i < victim_count; i++) {
+        vfs_run_release(releases[i]);
+    }
 
     mutex_lock(&self->mount_lock);
 
@@ -1279,6 +1383,8 @@ void vfs_update(void) {
             process_file_watcher_changes(mount, watcher, temp.arena);
         }
     }
+
+    vfs_reclaim_closed_handles(self);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -34,10 +34,11 @@ pub use generated::vfs::{
 };
 /// The consumer VFS ABI: the opaque FlVfsMount, the result PODs (VfsData / VfsFileList /
 /// VfsMountInfo / VfsMountResult), the VfsMountStatus / VfsLoadPriority /
-/// VfsMountErrorStatus enums, and the VfsReadCallback post-processing hook.
+/// VfsMountErrorStatus enums, and a read's VfsReadCallback post-processing hook and
+/// VfsReleaseCallback user_data release hook.
 pub use generated::vfs::{
     FlVfsMount, VfsData, VfsFileList, VfsLoadPriority, VfsMountErrorStatus, VfsMountInfo,
-    VfsMountResult, VfsMountStatus, VfsReadCallback,
+    VfsMountResult, VfsMountStatus, VfsReadCallback, VfsReleaseCallback,
 };
 pub use generated::vfs_listing::VfsListingCallback;
 /// The VFS driver-plugin ABI: the VfsPlugin fn-pointer vtable a driver implements plus its

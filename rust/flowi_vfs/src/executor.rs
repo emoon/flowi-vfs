@@ -310,6 +310,7 @@ mod tests {
         _path: sys::RawStr,
         _cb: sys::VfsReadCallback,
         _ud: *mut std::os::raw::c_void,
+        _release: sys::VfsReleaseCallback,
         _reuse: u32,
     ) -> u32 {
         FAKE.with(|f| {

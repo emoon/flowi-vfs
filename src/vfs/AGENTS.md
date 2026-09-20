@@ -97,6 +97,7 @@ Interacts exclusively through the `FlVfsPlugin` vtable:
 - **Per-worker plugin handles:** `VfsHandles` stores `MAX_JOB_THREADS` (2) pre-cloned handles per tree node, indexed by `worker_index`. `vfs_init()` fails if the job system has more workers, and `vfs_tree_walk_and_resolve()` rejects out-of-range worker indices
 - **Per-listing arenas:** Each listing gets its own arena, bulk-freed on `vfs_close()`
 - **Cooperative cancellation:** `vfs_cancel(handle)` sets atomic flag; long operations check `vfs_should_cancel()`
+- **Deferred close:** `vfs_close()` never waits on the main thread. A handle whose job is still running is marked `closed` (absent to callers, id reserved) and freed by `vfs_reclaim_closed_handles()` from `vfs_update()` / `vfs_wait_all()` / the next `vfs_close()`. A read-all's `release` hook runs once at that free, outside `handle_lock`, and is how `user_data`'s owner learns the worker is done
 - **Nil object:** `fl_nil_vfs_entry` returned instead of nullptr from lookups
 - **Archive-in-archive:** Transparent nesting. Tries file-path-based open first (avoids RAM copy), falls back to `open_memory()`
 - **Two-phase prepare/dispatch:** `vfs_mount_read_all_prepare()` + `vfs_dispatch()` for capturing handle ID before job runs
