@@ -133,10 +133,6 @@ void vfs_dispatch(FlVfsHandle handle);
 
 void vfs_wait_all(void);
 
-// Schedule a job to run after a VFS operation completes
-// Note: From worker threads, this schedules immediately (VFS ops are sync there)
-FlJobHandle vfs_schedule_job(FlVfsHandle handle, FlJobsFunc func, void* user_data);
-
 VfsOpStatus vfs_get_status(FlVfsHandle handle);
 
 // Note: This is cooperative cancellation - the operation will check for cancellation

@@ -593,17 +593,6 @@ void vfs_wait_all(void) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-FlJobHandle vfs_schedule_job(FlVfsHandle handle, FlJobsFunc func, void* user_data) {
-    VfsHandleSnapshot snap;
-    if (!vfs_snapshot_handle(handle, &snap)) {
-        return fl_jobs_add_job(func, user_data);
-    }
-
-    return fl_jobs_add_job_with_dependency(func, user_data, snap.job_handle);
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
 bool vfs_is_ready(FlVfsHandle handle) {
     profile_function_auto_nc("vfs:vfs_is_ready", PROFILE_COLOR_CYAN);
     // ready covers both the synchronous case (job_handle 0) and a finished/recycled async job
