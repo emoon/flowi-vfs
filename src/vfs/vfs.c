@@ -300,13 +300,34 @@ void vfs_register_driver(const FlVfsPlugin* plugin, void* instance) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Handle allocation helpers
 
+// Everything a handle is born with, so every birth states the same set of fields. Filled with designated
+// initializers at the call site: the tail of this was a positional run of four interchangeable pointers,
+// of which most callers pass nothing, and a swapped pair compiled clean. A zeroed field is the "not
+// applicable" case for every one of them - FL_VFS_HANDLE_INVALID is 0, as is an empty FlString.
+typedef struct VfsOpParams {
+    FlVfsMount* mount;
+    FlString path;
+    VfsOperationType op_type;
+    int depth;
+    FlArena* target_arena;
+    FlVfsReadCallback callback;
+    void* user_data;
+    FlVfsReleaseCallback release;
+    FlVfsHandle reuse_handle;
+    FlString filter_needle;
+    u32 open_flags;
+} VfsOpParams;
+
 // Allocates and initializes a handle WITHOUT publishing it in the handle map. Until vfs_publish_handle()
 // runs, the handle is private to the calling thread, so field writes need no lock. Callers finish op-specific
 // setup (and job scheduling) on the private handle, then publish as the last step.
-static VfsHandleData* allocate_handle(VfsState* self, FlVfsMount* mount, FlString path, VfsOperationType op_type,
-                                      FlVfsReadCallback callback, void* user_data, FlVfsReleaseCallback release,
-                                      FlVfsHandle reuse_handle) {
+//
+// This is the only place a VfsHandleData is born: every op type goes through it, including the read and
+// write chained onto an open file handle, so a field added here cannot miss one of them.
+static VfsHandleData* allocate_handle(VfsState* self, const VfsOpParams* params) {
     FL_VALIDATE_RET(self != nullptr, nullptr);
+
+    FlVfsMount* mount = params->mount;
 
     // handle_lock protects the pool, next_handle_id, and the reuse check
     mutex_lock(&self->handle_lock);
@@ -316,29 +337,36 @@ static VfsHandleData* allocate_handle(VfsState* self, FlVfsMount* mount, FlStrin
     // Zero the handle to avoid garbage values from pool reuse
     memory_zero(handle, sizeof(VfsHandleData));
 
-    if (reuse_handle != FL_VFS_HANDLE_INVALID) {
-        VfsHandleData** existing = hashmap_get(&self->handle_map, reuse_handle);
+    if (params->reuse_handle != FL_VFS_HANDLE_INVALID) {
+        VfsHandleData** existing = hashmap_get(&self->handle_map, params->reuse_handle);
         if (existing && *existing) {
-            logc_warning(VFS_ID, "Handle %u still exists in map - cannot reuse. Call vfs_close() first!", reuse_handle);
+            logc_warning(VFS_ID, "Handle %u still exists in map - cannot reuse. Call vfs_close() first!",
+                         params->reuse_handle);
             pool_free(&self->handle_pool, handle);
             mutex_unlock(&self->handle_lock);
             return nullptr;
         }
-        handle->id = reuse_handle;
+        handle->id = params->reuse_handle;
     } else {
         handle->id = self->next_handle_id++;
     }
 
     mutex_unlock(&self->handle_lock);
 
-    // StringAllocator is thread-safe (has internal mutex), so the copy needs no tree_lock
-    handle->path = string_allocator_copy(mount->strings, path);
+    // StringAllocator is thread-safe (has internal mutex), so the copies need no tree_lock. The needle is
+    // copied for the same reason as the path: the job matches against it long after the caller's frame is
+    // gone, and callers filter with scratch strings. An empty or static string copies to itself, without
+    // allocating, which is what an op with no path or no filter gets.
+    handle->path = string_allocator_copy(mount->strings, params->path);
+    handle->filter_needle = string_allocator_copy(mount->strings, params->filter_needle);
 
     handle->mount = mount;
-    handle->op_type = op_type;
-    handle->callback = callback;
-    handle->user_data = user_data;
-    handle->release = release;
+    handle->op_type = params->op_type;
+    handle->callback = params->callback;
+    handle->user_data = params->user_data;
+    handle->release = params->release;
+    handle->target_arena = params->target_arena;
+    handle->depth = params->depth;
     handle->result_arena = nullptr; // Will be set for list operations
     handle->job_handle = 0;
     handle->priority = FlVfsLoadPriority_Normal;
@@ -346,6 +374,8 @@ static VfsHandleData* allocate_handle(VfsState* self, FlVfsMount* mount, FlStrin
     atomic_init(&handle->result_data, nullptr);
     atomic_init(&handle->error_status, VFS_STATE_PENDING);
     atomic_init(&handle->cancel_requested, false);
+    // Set before any scheduling the caller does, so the job cannot read it unset.
+    atomic_init(&handle->open_flags, params->open_flags);
 
     return handle;
 }
@@ -363,41 +393,22 @@ static void vfs_publish_handle(VfsState* self, VfsHandleData* handle) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static FlVfsHandle allocate_op_ex(VfsState* self, FlVfsMount* mount, FlString path, VfsOperationType op, int depth,
-                                  struct FlArena* target_arena, FlVfsReadCallback callback, void* user_data,
-                                  FlVfsReleaseCallback release, FlVfsHandle reuse_handle, FlString filter_needle,
-                                  u32 open_flags) {
-
-    VfsHandleData* handle = allocate_handle(self, mount, path, op, callback, user_data, release, reuse_handle);
+// Allocate, schedule and publish an op against a mount, in that order.
+static FlVfsHandle allocate_op(VfsState* self, const VfsOpParams* params) {
+    VfsHandleData* handle = allocate_handle(self, params);
 
     FL_VALIDATE_RET(handle != nullptr, FL_VFS_HANDLE_INVALID);
-
-    handle->target_arena = target_arena;
-    // Copied like the path above: the job matches against this long after the caller's frame is gone, and
-    // callers filter with scratch strings. An empty or static needle copies to itself, without allocating.
-    handle->filter_needle = string_allocator_copy(mount->strings, filter_needle);
-    handle->depth = depth;
-
-    // Set open_flags BEFORE scheduling job to avoid race condition
-    atomic_store(&handle->open_flags, open_flags);
 
     // Scheduling can execute the job inline on a worker thread, so it happens before publication - the
     // job holds the raw pointer and never needs the map entry. No field of a visible handle is ever
     // written without handle_lock.
-    handle->job_handle = vfs_ops_schedule_job(mount, vfs_ops_do_job, handle);
+    handle->job_handle = vfs_ops_schedule_job(params->mount, vfs_ops_do_job, handle);
     handle->last_job = handle->job_handle;
 
     FlVfsHandle id = handle->id;
     vfs_publish_handle(self, handle);
 
     return id;
-}
-
-static FlVfsHandle allocate_op(VfsState* self, FlVfsMount* mount, FlString path, VfsOperationType op, int depth,
-                               struct FlArena* target_arena, FlVfsReadCallback callback, void* user_data,
-                               FlVfsReleaseCallback release, FlVfsHandle reuse_handle, FlString filter_needle) {
-    return allocate_op_ex(self, mount, path, op, depth, target_arena, callback, user_data, release, reuse_handle,
-                          filter_needle, 0);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -443,8 +454,11 @@ FlVfsMountResult vfs_mount_with_options(FlString source_path, FlVfsMountOptions 
     mount->root_node = vfs_tree_create_node(mount, source_path);
     mount->root_node->is_directory = true;
 
-    VfsHandleData* handle
-        = allocate_handle(self, mount, source_path, VfsOp_Mount, nullptr, nullptr, nullptr, FL_VFS_HANDLE_INVALID);
+    VfsHandleData* handle = allocate_handle(self, &(VfsOpParams) {
+                                                      .mount = mount,
+                                                      .path = source_path,
+                                                      .op_type = VfsOp_Mount,
+                                                  });
 
     mount->source_path = string_allocator_copy(mount->strings, source_path);
 
@@ -515,8 +529,13 @@ FlVfsDirHandle vfs_get_listing_filtered(FlVfsMount* mount, FlString relative_pat
 
     FL_VALIDATE_LOG(mount != nullptr, FL_VFS_DIR_HANDLE_INVALID, logc_error(VFS_ID, "Invalid mount for get_listing"));
 
-    return allocate_op(g_vfs_state, mount, relative_path, VfsOp_MountList, depth, nullptr, nullptr, nullptr, nullptr,
-                       FL_VFS_HANDLE_INVALID, filter_needle);
+    return allocate_op(g_vfs_state, &(VfsOpParams) {
+                                        .mount = mount,
+                                        .path = relative_path,
+                                        .op_type = VfsOp_MountList,
+                                        .depth = depth,
+                                        .filter_needle = filter_needle,
+                                    });
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -933,8 +952,15 @@ FlVfsHandle vfs_mount_read_all_with_options(FlVfsMount* mount, FlString relative
                                             void* user_data, FlVfsReleaseCallback release, FlVfsHandle reuse_handle) {
     FL_VALIDATE_RET(mount != nullptr, FL_VFS_HANDLE_INVALID);
 
-    return allocate_op(g_vfs_state, mount, relative_path, VfsOp_ReadAll, 0, nullptr, callback, user_data, release,
-                       reuse_handle, (FlString) { 0 });
+    return allocate_op(g_vfs_state, &(VfsOpParams) {
+                                        .mount = mount,
+                                        .path = relative_path,
+                                        .op_type = VfsOp_ReadAll,
+                                        .callback = callback,
+                                        .user_data = user_data,
+                                        .release = release,
+                                        .reuse_handle = reuse_handle,
+                                    });
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -944,8 +970,15 @@ FlVfsHandle vfs_mount_read_all_prepare(FlVfsMount* mount, FlString relative_path
                                        void* user_data, FlVfsReleaseCallback release, FlVfsHandle reuse_handle) {
     FL_VALIDATE_RET(mount != nullptr, FL_VFS_HANDLE_INVALID);
 
-    VfsHandleData* handle
-        = allocate_handle(g_vfs_state, mount, relative_path, VfsOp_ReadAll, callback, user_data, release, reuse_handle);
+    VfsHandleData* handle = allocate_handle(g_vfs_state, &(VfsOpParams) {
+                                                             .mount = mount,
+                                                             .path = relative_path,
+                                                             .op_type = VfsOp_ReadAll,
+                                                             .callback = callback,
+                                                             .user_data = user_data,
+                                                             .release = release,
+                                                             .reuse_handle = reuse_handle,
+                                                         });
     FL_VALIDATE_RET(handle != nullptr, FL_VFS_HANDLE_INVALID);
 
     FlVfsHandle id = handle->id;
@@ -995,8 +1028,12 @@ void vfs_dispatch(FlVfsHandle handle) {
 FlVfsHandle vfs_mount_open(FlVfsMount* mount, FlString relative_path, u32 flags) {
     FL_VALIDATE_RET(mount != nullptr, FL_VFS_HANDLE_INVALID);
 
-    return allocate_op_ex(g_vfs_state, mount, relative_path, VfsOp_FileOpen, 0, nullptr, nullptr, nullptr, nullptr,
-                          FL_VFS_HANDLE_INVALID, (FlString) { 0 }, flags);
+    return allocate_op(g_vfs_state, &(VfsOpParams) {
+                                        .mount = mount,
+                                        .path = relative_path,
+                                        .op_type = VfsOp_FileOpen,
+                                        .open_flags = flags,
+                                    });
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1067,23 +1104,33 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
     // and its plugin_file_handle - all of which the job scheduled below still reaches through file_handle.
     atomic_fetch_add_explicit(&file_data->pending_dispatches, 1, memory_order_release);
 
-    VfsHandleData* op_handle = pool_alloc(&self->handle_pool);
-    memory_zero(op_handle, sizeof(VfsHandleData));
-
-    u32 op_id = self->next_handle_id++;
-    op_handle->id = op_id;
-
     mutex_unlock(&self->handle_lock);
 
-    // Setup op handle - private until published, so no lock is needed
-    op_handle->op_type = params->op_type;
+    // Born through the one handle-birth path like every other op, so it gets the same atomic_init and the
+    // same initial status rather than relying on memory_zero to stand in for them. A chained op carries no
+    // path, no filter and no callback of its own: it is named by the file handle it chains onto.
+    VfsHandleData* op_handle = allocate_handle(self, &(VfsOpParams) {
+                                                         .mount = mount,
+                                                         .op_type = params->op_type,
+                                                     });
+    if (!op_handle) {
+        mutex_lock(&self->handle_lock);
+        VfsHandleData* file_failed = vfs_lookup_handle_locked(self, file_handle);
+        if (file_failed) {
+            atomic_fetch_sub_explicit(&file_failed->pending_dispatches, 1, memory_order_release);
+        }
+        mutex_unlock(&self->handle_lock);
+        return FL_VFS_HANDLE_INVALID;
+    }
+
+    // The rest is op-specific and stays here: the handle is private until published, so no lock is needed.
+    u32 op_id = op_handle->id;
     op_handle->file_handle = file_handle;
     op_handle->read_buffer = params->read_buffer;
     op_handle->read_size = params->read_size;
     op_handle->write_data = params->write_data;
     op_handle->write_size = params->write_size;
     op_handle->write_data_owned = params->write_data_owned;
-    op_handle->mount = mount;
 
     bool chain_refused = false;
 
@@ -1121,6 +1168,7 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
         // A deferred close left the handle closed, and the reclaim sweep takes it once this reaches 0.
         atomic_fetch_sub_explicit(&file_now->pending_dispatches, 1, memory_order_release);
     }
+    // Published last, as on every other path, and in the same critical section that drops the guard.
     hashmap_insert(&self->handle_map, op_id, op_handle);
     mutex_unlock(&self->handle_lock);
 
