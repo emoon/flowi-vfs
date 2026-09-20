@@ -36,8 +36,6 @@ const FlVfsEntry fl_nil_vfs_entry = { 0 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-FlString vfs_format_error_message(FlArena* scratch, const char* fmt, ...);
-void vfs_free_error_message(VfsState* self, FlString error_message);
 static void vfs_reclaim_closed_handles(VfsState* self);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -665,9 +663,8 @@ FlVfsFileList vfs_get_file_list(FlVfsDirHandle handle) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Error handling
 
-FlString vfs_format_error_message(FlArena* scratch, const char* fmt, ...) {
+FlString vfs_format_error_message(const char* fmt, ...) {
     profile_function_auto_nc("vfs:vfs_format_error", PROFILE_COLOR_CYAN);
-    UNUSED(scratch); // error_report uses its own thread-safe arena
 
     va_list args;
     va_start(args, fmt);
@@ -679,20 +676,12 @@ FlString vfs_format_error_message(FlArena* scratch, const char* fmt, ...) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void vfs_free_error_message(VfsState* self, FlString error_message) {
-    UNUSED(self);
-    UNUSED(error_message);
-    profile_function_auto_nc("vfs:free_error_message", PROFILE_COLOR_CYAN);
-    // No-op: error messages now managed by error_report arena (bulk cleanup via error_report_cleanup())
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static void vfs_free_data_result(VfsState* self, FlVfsData* result, bool free_data_buffer) {
+// An error_message needs no freeing here: error_report owns that storage and bulk-frees it in
+// error_report_cleanup().
+static void vfs_free_data_result(FlVfsData* result, bool free_data_buffer) {
     if (free_data_buffer && result->data) {
         mi_free((void*)result->data);
     }
-    vfs_free_error_message(self, result->error_message);
     mi_free(result);
 }
 
@@ -701,41 +690,61 @@ static void vfs_free_data_result(VfsState* self, FlVfsData* result, bool free_da
 static void vfs_free_handle_resources(VfsState* self, VfsHandleData* handle_data) {
     FlVfsData* result = atomic_load_explicit(&handle_data->result_data, memory_order_acquire);
 
-    if (handle_data->op_type == VfsOp_FileRead && result) {
-        // result->data points at the caller-provided read buffer (vfs_read rejects a null buffer), so the
-        // data is never ours to free - only the result struct and its error message.
-        vfs_free_data_result(self, result, false);
-    }
-
-    if (result && handle_data->op_type == VfsOp_MountList) {
-        FlVfsFileList* list = (FlVfsFileList*)result;
-        vfs_free_error_message(self, list->error_message);
-        // If no result_arena, this is an error case - struct was mi_alloc'd
-        if (!handle_data->result_arena) {
-            mi_free(list);
+    // Switched rather than chained so a new op type fails the -Werror build here until it says what it owns.
+    switch (handle_data->op_type) {
+        case VfsOp_Mount: {
+            // Owns nothing of its own: a mount's storage belongs to the FlVfsMount, not to this handle.
+            break;
         }
-    }
 
-    if (handle_data->op_type == VfsOp_FileOpen && handle_data->plugin_file_handle) {
-        if (handle_data->plugin_entry && handle_data->plugin_entry->plugin->close) {
-            handle_data->plugin_entry->plugin->close(handle_data->plugin_entry->plugin_instance,
-                                                     handle_data->plugin_file_handle);
+        case VfsOp_MountList: {
+            if (result) {
+                FlVfsFileList* list = (FlVfsFileList*)result;
+                // With a result_arena the listing lives in that arena, destroyed below; without one this is
+                // the error path, where the struct was mi_alloc'd on its own.
+                if (!handle_data->result_arena) {
+                    mi_free(list);
+                }
+            }
+            break;
         }
-    }
 
-    if (handle_data->op_type == VfsOp_FileWrite) {
-        // Only free if VFS made a copy (vfs_write), not if caller retained ownership (vfs_write_no_copy)
-        if (handle_data->write_data && handle_data->write_data_owned) {
-            mi_free((void*)handle_data->write_data);
+        case VfsOp_FileOpen: {
+            if (handle_data->plugin_file_handle && handle_data->plugin_entry
+                && handle_data->plugin_entry->plugin->close) {
+                handle_data->plugin_entry->plugin->close(handle_data->plugin_entry->plugin_instance,
+                                                         handle_data->plugin_file_handle);
+            }
+            break;
         }
-        // The payload is write_data (freed above); the write result struct never owns a data buffer.
-        if (result) {
-            vfs_free_data_result(self, result, false);
-        }
-    }
 
-    if (handle_data->op_type == VfsOp_ReadAll && result) {
-        vfs_free_data_result(self, result, !handle_data->callback_owns_data);
+        case VfsOp_FileRead: {
+            if (result) {
+                // result->data points at the caller-provided read buffer (vfs_read rejects a null buffer),
+                // so the data is never ours to free - only the result struct.
+                vfs_free_data_result(result, false);
+            }
+            break;
+        }
+
+        case VfsOp_FileWrite: {
+            // Only free if VFS made a copy (vfs_write), not if caller retained ownership (vfs_write_no_copy)
+            if (handle_data->write_data && handle_data->write_data_owned) {
+                mi_free((void*)handle_data->write_data);
+            }
+            // The payload is write_data (freed above); the write result struct never owns a data buffer.
+            if (result) {
+                vfs_free_data_result(result, false);
+            }
+            break;
+        }
+
+        case VfsOp_ReadAll: {
+            if (result) {
+                vfs_free_data_result(result, !handle_data->callback_owns_data);
+            }
+            break;
+        }
     }
 
     // Destroy result arena if it exists (for successful directory listings)

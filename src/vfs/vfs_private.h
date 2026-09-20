@@ -120,9 +120,9 @@ bool vfs_ops_check_if_archive(VfsState* self, FlString file_path);
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Core VFS functions (defined in vfs.c)
 
-// Error handling
-FlString vfs_format_error_message(FlArena* scratch, const char* fmt, ...);
-void vfs_free_error_message(VfsState* self, FlString error_message);
+// Error handling. The returned string is owned by error_report, which bulk-frees it in
+// error_report_cleanup(), so there is nothing for a caller to free.
+FlString vfs_format_error_message(const char* fmt, ...);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Cancellation support

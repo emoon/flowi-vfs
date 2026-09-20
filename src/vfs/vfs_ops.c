@@ -187,7 +187,7 @@ static void read_all_set_error(VfsHandleData* handle, FlVfsData* result, const F
     if (buffer) {
         mi_free(buffer);
     }
-    result->error_message = vfs_format_error_message(nullptr, error_fmt, handle->path);
+    result->error_message = vfs_format_error_message(error_fmt, handle->path);
     plugin->close(instance, file_handle);
     handle->plugin_file_handle = nullptr;
     read_all_notify_failure(handle);
@@ -209,7 +209,7 @@ static void vfs_op_read_all(VfsState* self, VfsHandleData* handle, FlArena* scra
 
     VfsOpStatus open_status = atomic_load_explicit(&handle->error_status, memory_order_acquire);
     if (open_status != VFS_STATE_SUCCESS) {
-        result->error_message = vfs_format_error_message(nullptr, "Failed to read '%S': file not found", handle->path);
+        result->error_message = vfs_format_error_message("Failed to read '%S': file not found", handle->path);
         read_all_notify_failure(handle);
         atomic_store_explicit(&handle->result_data, result, memory_order_release);
         return;
@@ -449,13 +449,13 @@ static bool vfs_dir_entry_callback(void* user_data, const FlVfsEntry* entry_ptr)
 // Failure path for directory listing. Destroys list_arena when non-null (the earliest failures happen before
 // it exists). Logging stays at the call site since the message and level differ per failure.
 
-static void vfs_list_fail(VfsHandleData* handle, FlArena* scratch, FlArena* list_arena, VfsOpStatus status,
-                          const char* fmt, FlString path) {
+static void vfs_list_fail(VfsHandleData* handle, FlArena* list_arena, VfsOpStatus status, const char* fmt,
+                          FlString path) {
     atomic_store_explicit(&handle->error_status, status, memory_order_release);
 
     FlVfsFileList* error_result = mi_alloc_zero(FlVfsFileList);
     error_result->success = false;
-    error_result->error_message = vfs_format_error_message(scratch, fmt, path);
+    error_result->error_message = vfs_format_error_message(fmt, path);
     atomic_store_explicit(&handle->result_data, error_result, memory_order_release);
 
     if (list_arena) {
@@ -474,7 +474,7 @@ void vfs_op_list(VfsState* self, VfsHandleData* handle, FlArena* scratch, int th
 
     if (!mount || !mount->root_node || !mount->root_node->plugin_entry) {
         logc_error(VFS_ID, "No correct plugin set up for VFS mount list");
-        vfs_list_fail(handle, scratch, nullptr, VFS_ERROR_MOUNT, "Failed to list '%S': Mount not ready", path);
+        vfs_list_fail(handle, nullptr, VFS_ERROR_MOUNT, "Failed to list '%S': Mount not ready", path);
         return;
     }
 
@@ -487,14 +487,14 @@ void vfs_op_list(VfsState* self, VfsHandleData* handle, FlArena* scratch, int th
 
         if (!walk.success || !walk.plugin_entry) {
             logc_info(VFS_ID, "mount: %S : Directory not found %S", mount->source_path, path);
-            vfs_list_fail(handle, scratch, list_arena, VFS_ERROR_PATH, "Failed to list '%S': Path not found", path);
+            vfs_list_fail(handle, list_arena, VFS_ERROR_PATH, "Failed to list '%S': Path not found", path);
             return;
         }
 
         if (!walk.plugin_entry->plugin->list_directory) {
             logc_error(VFS_ID, "Plugin %S does not support directory listing", walk.plugin_entry->plugin->plugin_name);
-            vfs_list_fail(handle, scratch, list_arena, VFS_ERROR_DRIVER,
-                          "Failed to list '%S': Plugin does not support listing", path);
+            vfs_list_fail(handle, list_arena, VFS_ERROR_DRIVER, "Failed to list '%S': Plugin does not support listing",
+                          path);
             return;
         }
 
@@ -518,7 +518,7 @@ void vfs_op_list(VfsState* self, VfsHandleData* handle, FlArena* scratch, int th
     // Cooperative cancellation: if the listing was canceled (enumeration stopped early or cancel arrived
     // after it finished), report it rather than returning a partial/complete result the caller abandoned.
     if (vfs_should_cancel(handle)) {
-        vfs_list_fail(handle, scratch, list_arena, VFS_ERROR_CANCELED, "Listing of '%S' canceled", path);
+        vfs_list_fail(handle, list_arena, VFS_ERROR_CANCELED, "Listing of '%S' canceled", path);
         return;
     }
 
