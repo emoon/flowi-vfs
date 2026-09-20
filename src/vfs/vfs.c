@@ -479,8 +479,7 @@ FlVfsMountResult vfs_mount_with_options(FlString source_path, FlVfsMountOptions 
     mount->strings = string_allocator_new(mount->nodes_arena);
     mutex_init(&mount->tree_lock);
 
-    mount->root_node = vfs_tree_create_node(mount, source_path);
-    mount->root_node->is_directory = true;
+    mount->root_node = vfs_tree_create_root_node(mount, source_path);
 
     VfsHandleData* handle = allocate_handle(self, &(VfsOpParams) {
                                                       .mount = mount,
@@ -1282,55 +1281,43 @@ static bool vfs_handle_is_on_mount(const VfsHandleData* handle_data, void* ctx) 
     return handle_data->mount == (const FlVfsMount*)ctx;
 }
 
-void vfs_mount_close(FlVfsMount* mount) {
-    profile_function_auto_nc("vfs:vfs_mount_close", PROFILE_COLOR_CYAN);
-    VfsState* self = g_vfs_state;
+// One handle to be torn down with its mount, as vfs_mount_close needs it after handle_lock is released:
+// the id to re-look it up by, and the jobs to drain before the mount's arena goes.
+typedef struct VfsMountVictim {
+    FlVfsHandle id;
+    VfsHandleJobs jobs;
+} VfsMountVictim;
 
-    FL_VALIDATE(self != nullptr);
-    FL_VALIDATE(mount != nullptr);
-
-    // Validate mount is in our list (detect use-after-free)
-    bool found_in_list = false;
-    mutex_lock(&self->mount_lock);
-    for_each_list(m, self->mount_first) {
-        if (m == mount) {
-            found_in_list = true;
-            break;
-        }
-    }
-    mutex_unlock(&self->mount_lock);
-
-    if (!found_in_list) {
-        logc_error(VFS_ID, "vfs_mount_close: mount %p not in list (double-close or use-after-free)", (void*)mount);
-        return;
-    }
-
-    // Snapshot this mount's handles once (id + their jobs), then drain-then-free over the array below.
-    // Handles the caller issues against this mount after this snapshot are a close-ordering bug and are
-    // not reaped here - they must be vfs_close()'d before the mount.
-    arena_scratch_auto(temp);
+// Snapshots every handle belonging to mount. Handles the caller issues against the mount after this are a
+// close-ordering bug and are not reaped: they must be vfs_close()'d before the mount. Ids and jobs are
+// copied out rather than the pointers, because a concurrent vfs_close() on a leaked handle may free one
+// before the teardown pass gets to it.
+static u64 vfs_snapshot_mount_victims(VfsState* self, FlVfsMount* mount, FlArena* arena, VfsMountVictim** out) {
     mutex_lock(&self->handle_lock);
-    u64 map_count = hashmap_count(&self->handle_map);
-    VfsHandleData** found = arena_alloc_array(temp.arena, VfsHandleData*, map_count);
-    FlVfsHandle* victims = arena_alloc_array(temp.arena, FlVfsHandle, map_count);
-    VfsHandleJobs* victim_jobs = arena_alloc_array(temp.arena, VfsHandleJobs, map_count);
 
-    u64 victim_count = vfs_collect_handles_locked(self, vfs_handle_is_on_mount, mount, found);
-    // Id and jobs copied out here, not the pointers: a concurrent vfs_close() on a leaked handle may free
-    // one of these between the unlock below and the free pass further down.
-    for (u64 i = 0; i < victim_count; i++) {
-        victims[i] = found[i]->id;
-        victim_jobs[i] = vfs_handle_jobs(found[i]->job_handle, found[i]->last_job);
+    u64 map_count = hashmap_count(&self->handle_map);
+    VfsHandleData** found = arena_alloc_array(arena, VfsHandleData*, map_count);
+    VfsMountVictim* victims = arena_alloc_array(arena, VfsMountVictim, map_count);
+
+    u64 count = vfs_collect_handles_locked(self, vfs_handle_is_on_mount, mount, found);
+    for (u64 i = 0; i < count; i++) {
+        victims[i].id = found[i]->id;
+        victims[i].jobs = vfs_handle_jobs(found[i]->job_handle, found[i]->last_job);
     }
-    VfsReleaseList releases = vfs_release_list_new(temp.arena, victim_count);
+
     mutex_unlock(&self->handle_lock);
 
-    // Drain this mount's in-flight ops before its tree, strings and arena are destroyed. fl_jobs_wait()
-    // must run WITHOUT handle_lock, which the job itself takes to look up its handle.
+    *out = victims;
+    return count;
+}
+
+// Waits out this mount's in-flight ops before its tree, strings and arena are destroyed. Runs WITHOUT
+// handle_lock, which the jobs themselves take to look their handles up.
+static void vfs_drain_mount_victims(FlVfsMount* mount, const VfsMountVictim* victims, u64 count) {
     int inflight_jobs = 0;
-    for (u64 i = 0; i < victim_count; i++) {
-        for (u32 j = 0; j < victim_jobs[i].count; j++) {
-            FlJobHandle job = victim_jobs[i].handles[j];
+    for (u64 i = 0; i < count; i++) {
+        for (u32 j = 0; j < victims[i].jobs.count; j++) {
+            FlJobHandle job = victims[i].jobs.handles[j];
             if (job && fl_jobs_is_finished(job) == FlJobsResult_NotFinished) {
                 fl_jobs_wait(job);
                 inflight_jobs++;
@@ -1344,66 +1331,41 @@ void vfs_mount_close(FlVfsMount* mount) {
                     (void*)mount, inflight_jobs);
     }
 
-    // Only wait for mount job AFTER all operations complete (handles shutdown order issues)
+    // The mount's own job only after its operations are done, which settles shutdown ordering.
     if (mount->job_handle) {
         fl_jobs_wait(mount->job_handle);
     }
+}
 
-    mutex_lock(&self->handle_lock);
-
-    // Remove and free every handle snapshotted above. Their paths live in mount->strings, so this must run
-    // before nodes_arena is destroyed below, and it frees resources directly rather than through vfs_close(),
-    // which would re-take handle_lock and re-wait jobs. Each id is re-looked up under the lock because a
-    // concurrent vfs_close() on a leaked handle may already have removed it.
-    for (u64 i = 0; i < victim_count; i++) {
-        VfsHandleData** victim_ptr = hashmap_get(&self->handle_map, victims[i]);
+// Removes and frees the snapshotted handles. Their paths live in mount->strings, so this must run before
+// nodes_arena is destroyed, and it frees resources directly rather than through vfs_close(), which would
+// re-take handle_lock and re-wait the jobs. Each id is re-looked up because a concurrent vfs_close() on a
+// leaked handle may already have removed it.
+static void vfs_free_mount_victims(VfsState* self, const VfsMountVictim* victims, u64 count, VfsReleaseList* releases) {
+    for (u64 i = 0; i < count; i++) {
+        VfsHandleData** victim_ptr = hashmap_get(&self->handle_map, victims[i].id);
         VfsHandleData* victim_data = victim_ptr ? *victim_ptr : nullptr;
         if (victim_data) {
-            vfs_release_list_push(&releases, vfs_free_handle_locked(self, victim_data));
+            vfs_release_list_push(releases, vfs_free_handle_locked(self, victim_data));
         }
     }
+}
 
-    if (mount->watching_enabled && mount->watcher_handle != 0) {
-        file_watcher_stop(mount->watcher_handle);
-        mount->watcher_handle = 0;
-        mount->watching_enabled = false;
-    }
-
-    // If this is a child mount, unlink it from parent's VfsTreeNode tree
-    if (mount->root_node && mount->root_node->parent) {
-        mutex_lock(&mount->tree_lock);
-        VfsTreeNode* parent = mount->root_node->parent;
-        VfsTreeNode* prev = nullptr;
-        VfsTreeNode* current = parent->first_child;
-
-        while (current) {
-            if (current == mount->root_node) {
-                if (prev) {
-                    prev->next_sibling = current->next_sibling;
-                } else {
-                    parent->first_child = current->next_sibling;
-                }
-                mount->root_node->parent = nullptr;
-                mount->root_node->next_sibling = nullptr;
-                break;
-            }
-            prev = current;
-            current = current->next_sibling;
+// True when mount is still in the mount list. A mount that is not is a double-close or a use-after-free.
+static bool vfs_mount_is_listed(VfsState* self, const FlVfsMount* mount) {
+    mutex_lock_auto(&self->mount_lock);
+    for_each_list(m, self->mount_first) {
+        if (m == mount) {
+            return true;
         }
-        mutex_unlock(&mount->tree_lock);
     }
+    return false;
+}
 
-    if (mount->root_node) {
-        vfs_tree_cleanup_node(mount->root_node);
-    }
-
-    // Release handle_lock before acquiring mount_lock to maintain lock ordering
-    // (vfs_mount_with_options acquires mount_lock -> handle_lock, so we must respect that order)
-    mutex_unlock(&self->handle_lock);
-
-    vfs_release_list_run_all(&releases);
-
-    mutex_lock(&self->mount_lock);
+// Unlinks the mount from the list and destroys the storage it owns. Everything that could still reach it
+// has been drained by now.
+static void vfs_destroy_mount(VfsState* self, FlVfsMount* mount) {
+    mutex_lock_auto(&self->mount_lock);
 
     sll_queue_remove(self->mount_first, self->mount_last, mount);
 
@@ -1416,8 +1378,50 @@ void vfs_mount_close(FlVfsMount* mount) {
     memory_zero(mount, sizeof(FlVfsMount));
 
     pool_free(&self->vfs_mounts, mount);
+}
 
-    mutex_unlock(&self->mount_lock);
+void vfs_mount_close(FlVfsMount* mount) {
+    profile_function_auto_nc("vfs:vfs_mount_close", PROFILE_COLOR_CYAN);
+    VfsState* self = g_vfs_state;
+
+    FL_VALIDATE(self != nullptr);
+    FL_VALIDATE(mount != nullptr);
+
+    if (!vfs_mount_is_listed(self, mount)) {
+        logc_error(VFS_ID, "vfs_mount_close: mount %p not in list (double-close or use-after-free)", (void*)mount);
+        return;
+    }
+
+    arena_scratch_auto(temp);
+    VfsMountVictim* victims = nullptr;
+    u64 victim_count = vfs_snapshot_mount_victims(self, mount, temp.arena, &victims);
+    VfsReleaseList releases = vfs_release_list_new(temp.arena, victim_count);
+
+    vfs_drain_mount_victims(mount, victims, victim_count);
+
+    mutex_lock(&self->handle_lock);
+
+    vfs_free_mount_victims(self, victims, victim_count, &releases);
+
+    if (mount->watching_enabled && mount->watcher_handle != 0) {
+        file_watcher_stop(mount->watcher_handle);
+        mount->watcher_handle = 0;
+        mount->watching_enabled = false;
+    }
+
+    vfs_tree_unlink_from_parent(mount);
+
+    if (mount->root_node) {
+        vfs_tree_cleanup_node(mount->root_node);
+    }
+
+    // Release handle_lock before acquiring mount_lock to maintain lock ordering
+    // (vfs_mount_with_options acquires mount_lock -> handle_lock, so we must respect that order)
+    mutex_unlock(&self->handle_lock);
+
+    vfs_release_list_run_all(&releases);
+
+    vfs_destroy_mount(self, mount);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1547,7 +1551,7 @@ FlVfsMountStatus vfs_mount_get_status(FlVfsMount* mount) {
         }
     }
 
-    if (mount->root_node && mount->root_node->plugin_entry && mount->root_node->handles.handle[0]) {
+    if (vfs_tree_root_is_resolved(mount)) {
         return FlVfsMountStatus_Ready;
     }
 

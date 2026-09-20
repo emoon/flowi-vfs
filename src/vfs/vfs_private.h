@@ -58,9 +58,12 @@ extern VfsState* g_vfs_state;
 
 // Tree node operations
 VfsTreeNode* vfs_tree_create_node(FlVfsMount* mount, FlString name);
+VfsTreeNode* vfs_tree_create_root_node(FlVfsMount* mount, FlString name);
+bool vfs_tree_root_is_resolved(const FlVfsMount* mount);
 void vfs_tree_free_node(FlVfsMount* mount, VfsTreeNode* node);
 VfsTreeNode* vfs_tree_find_child_node(VfsTreeNode* parent, FlString name);
 void vfs_tree_add_child_node(VfsTreeNode* parent, VfsTreeNode* child);
+void vfs_tree_unlink_from_parent(FlVfsMount* mount);
 int vfs_tree_compare_nodes(VfsTreeNode* a, VfsTreeNode* b);
 bool vfs_tree_remove_node_by_path(FlVfsMount* mount, FlString relative_path);
 FlString vfs_tree_watcher_relative_path(FlString change_path, FlString source_path);

@@ -91,6 +91,24 @@ VfsTreeNode* vfs_tree_create_node(FlVfsMount* mount, FlString name) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The mount's own root node, which is a directory by construction: it is what every path within the mount
+// is resolved against.
+VfsTreeNode* vfs_tree_create_root_node(FlVfsMount* mount, FlString name) {
+    VfsTreeNode* node = vfs_tree_create_node(mount, name);
+    node->is_directory = true;
+    return node;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// True once the mount's root has been resolved to a driver and that driver has handed back a usable handle,
+// which is what makes the mount servable.
+bool vfs_tree_root_is_resolved(const FlVfsMount* mount) {
+    return mount->root_node && mount->root_node->plugin_entry && mount->root_node->handles.handle[0];
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void vfs_tree_free_node(FlVfsMount* mount, VfsTreeNode* node) {
     FL_VALIDATE(node != nullptr);
     string_allocator_free(mount->strings, node->name);
@@ -150,6 +168,39 @@ void vfs_tree_add_child_node(VfsTreeNode* parent, VfsTreeNode* child) {
     } else {
         child->next_sibling = prev->next_sibling;
         prev->next_sibling = child;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Unlinks a child mount's root node from the sibling list of the node it was mounted under, leaving it
+// parentless and ready for vfs_tree_cleanup_node. A no-op for a top-level mount, whose root has no parent.
+// Takes the mount's tree_lock, so the caller must not already hold it.
+void vfs_tree_unlink_from_parent(FlVfsMount* mount) {
+    profile_function_auto_nc("vfs:vfs_tree_unlink_from_parent", PROFILE_COLOR_CYAN);
+
+    if (!mount->root_node || !mount->root_node->parent) {
+        return;
+    }
+
+    mutex_lock_auto(&mount->tree_lock);
+
+    VfsTreeNode* node = mount->root_node;
+    VfsTreeNode* parent = node->parent;
+    VfsTreeNode* prev = nullptr;
+
+    for (VfsTreeNode* current = parent->first_child; current; current = current->next_sibling) {
+        if (current == node) {
+            if (prev) {
+                prev->next_sibling = current->next_sibling;
+            } else {
+                parent->first_child = current->next_sibling;
+            }
+            node->parent = nullptr;
+            node->next_sibling = nullptr;
+            return;
+        }
+        prev = current;
     }
 }
 
