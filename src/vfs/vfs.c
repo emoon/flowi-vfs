@@ -120,6 +120,34 @@ static void vfs_append_handle_jobs(FlJobHandle* dst, u64* count, VfsHandleJobs j
     }
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Collects the handles a walk is interested in, so the caller can act on them once handle_lock is released.
+// A null predicate takes every handle.
+//
+// Every walk over the handle map is two-pass, and not incidentally:
+//   - hashmap_remove unlinks the node for_each_hashmap is standing on, so nothing may be freed mid-walk;
+//   - fl_jobs_wait must not run under handle_lock, which the job itself takes to reach its handle;
+//   - a release hook is caller code, and one that reaches back into the VFS would deadlock on the lock.
+//
+// The pointers are only valid while the lock is held, so whatever a caller still needs after the unlock -
+// an id, a job handle - must be copied out of them inside the same critical section.
+//
+// Caller holds handle_lock. out must have room for hashmap_count(&self->handle_map) entries.
+typedef bool (*VfsHandlePredicate)(const VfsHandleData* handle_data, void* ctx);
+
+static u64 vfs_collect_handles_locked(VfsState* self, VfsHandlePredicate pred, void* ctx, VfsHandleData** out) {
+    u64 count = 0;
+    for_each_hashmap(&self->handle_map, key, val) {
+        (void)key;
+        VfsHandleData* handle_data = *val;
+        if (handle_data && (!pred || pred(handle_data, ctx))) {
+            out[count++] = handle_data;
+        }
+    }
+    return count;
+}
+
 static bool vfs_snapshot_handle(FlVfsHandle handle, VfsHandleSnapshot* out) {
     VfsState* self = g_vfs_state;
 
@@ -585,19 +613,19 @@ void vfs_wait_all(void) {
 
     FL_VALIDATE(self != nullptr);
 
-    // Snapshot the jobs while the map is stable, then wait without handle_lock: jobs may need that lock to
-    // finish. Handles published after this snapshot belong to a later wait_all call. Two slots per handle:
-    // its open job, and whatever was chained onto that after.
+    // Snapshot the jobs while the map is stable, then wait without handle_lock. Handles published after this
+    // snapshot belong to a later wait_all call. Two job slots per handle: its own job, and whatever was
+    // chained onto that after.
     arena_scratch_auto(temp);
     mutex_lock(&self->handle_lock);
     u64 handle_count = hashmap_count(&self->handle_map);
+    VfsHandleData** handles = arena_alloc_array(temp.arena, VfsHandleData*, handle_count);
     FlJobHandle* jobs = arena_alloc_array(temp.arena, FlJobHandle, handle_count * 2);
 
+    u64 collected = vfs_collect_handles_locked(self, nullptr, nullptr, handles);
     u64 job_count = 0;
-    for_each_hashmap(&self->handle_map, handle, handle_data_ptr) {
-        (void)handle;
-        VfsHandleData* handle_data = *handle_data_ptr;
-        vfs_append_handle_jobs(jobs, &job_count, vfs_handle_jobs(handle_data->job_handle, handle_data->last_job));
+    for (u64 i = 0; i < collected; ++i) {
+        vfs_append_handle_jobs(jobs, &job_count, vfs_handle_jobs(handles[i]->job_handle, handles[i]->last_job));
     }
     mutex_unlock(&self->handle_lock);
 
@@ -789,10 +817,36 @@ typedef struct VfsRelease {
     void* user_data;
 } VfsRelease;
 
+// The one place a release hook is invoked. It must never run under handle_lock: the hook is caller code,
+// and one that reaches back into the VFS would deadlock on the lock.
 static void vfs_run_release(VfsRelease release) {
     if (release.fn) {
         release.fn(release.user_data);
     }
+}
+
+// The hooks taken off a batch of freed handles: filled under handle_lock, drained after it is released.
+typedef struct VfsReleaseList {
+    VfsRelease* items;
+    u64 count;
+    u64 capacity;
+} VfsReleaseList;
+
+static VfsReleaseList vfs_release_list_new(FlArena* arena, u64 capacity) {
+    return (VfsReleaseList) { .items = arena_alloc_array(arena, VfsRelease, capacity), .capacity = capacity };
+}
+
+static void vfs_release_list_push(VfsReleaseList* list, VfsRelease release) {
+    FL_ASSERT(list->count < list->capacity);
+    list->items[list->count++] = release;
+}
+
+// Call with handle_lock released.
+static void vfs_release_list_run_all(VfsReleaseList* list) {
+    for (u64 i = 0; i < list->count; ++i) {
+        vfs_run_release(list->items[i]);
+    }
+    list->count = 0;
 }
 
 // Caller holds handle_lock and runs the returned release after letting it go. A chained read/write handle
@@ -809,6 +863,12 @@ static VfsRelease vfs_free_handle_locked(VfsState* self, VfsHandleData* handle_d
     return release;
 }
 
+static bool vfs_handle_is_reclaimable(const VfsHandleData* handle_data, void* ctx) {
+    UNUSED(ctx);
+    return handle_data->closed && atomic_load_explicit(&handle_data->pending_dispatches, memory_order_acquire) == 0
+           && vfs_jobs_finished(vfs_handle_jobs(handle_data->job_handle, handle_data->last_job));
+}
+
 // Frees every handle that was closed while its job was still running and whose jobs have finished since. A
 // closed handle stays in the map until then, so its id is neither reachable nor recycled and the job keeps
 // its raw pointer.
@@ -820,27 +880,16 @@ static void vfs_reclaim_closed_handles(VfsState* self) {
     }
 
     arena_scratch_auto(temp);
-    VfsHandleData** done = arena_alloc_array(temp.arena, VfsHandleData*, self->closed_count);
-    VfsRelease* releases = arena_alloc_array(temp.arena, VfsRelease, self->closed_count);
-    u32 done_count = 0;
-    for_each_hashmap(&self->handle_map, key, val) {
-        (void)key;
-        VfsHandleData* hd = *val;
-        if (hd && hd->closed && atomic_load_explicit(&hd->pending_dispatches, memory_order_acquire) == 0
-            && vfs_jobs_finished(vfs_handle_jobs(hd->job_handle, hd->last_job))) {
-            done[done_count++] = hd;
-        }
-    }
+    VfsHandleData** done = arena_alloc_array(temp.arena, VfsHandleData*, hashmap_count(&self->handle_map));
+    u64 done_count = vfs_collect_handles_locked(self, vfs_handle_is_reclaimable, nullptr, done);
+    VfsReleaseList releases = vfs_release_list_new(temp.arena, done_count);
 
-    // Removal after the walk: hashmap_remove unlinks the node for_each_hashmap is standing on.
-    for (u32 i = 0; i < done_count; ++i) {
-        releases[i] = vfs_free_handle_locked(self, done[i]);
+    for (u64 i = 0; i < done_count; ++i) {
+        vfs_release_list_push(&releases, vfs_free_handle_locked(self, done[i]));
     }
     mutex_unlock(&self->handle_lock);
 
-    for (u32 i = 0; i < done_count; ++i) {
-        vfs_run_release(releases[i]);
-    }
+    vfs_release_list_run_all(&releases);
 }
 
 // The ops that run against memory the caller lent for their duration: vfs_read's buffer and the data of
@@ -1229,6 +1278,10 @@ FlVfsHandle vfs_write_no_copy(FlVfsHandle file_handle, void* data, i64 size) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Mount close and lifecycle
 
+static bool vfs_handle_is_on_mount(const VfsHandleData* handle_data, void* ctx) {
+    return handle_data->mount == (const FlVfsMount*)ctx;
+}
+
 void vfs_mount_close(FlVfsMount* mount) {
     profile_function_auto_nc("vfs:vfs_mount_close", PROFILE_COLOR_CYAN);
     VfsState* self = g_vfs_state;
@@ -1258,18 +1311,18 @@ void vfs_mount_close(FlVfsMount* mount) {
     arena_scratch_auto(temp);
     mutex_lock(&self->handle_lock);
     u64 map_count = hashmap_count(&self->handle_map);
+    VfsHandleData** found = arena_alloc_array(temp.arena, VfsHandleData*, map_count);
     FlVfsHandle* victims = arena_alloc_array(temp.arena, FlVfsHandle, map_count);
     VfsHandleJobs* victim_jobs = arena_alloc_array(temp.arena, VfsHandleJobs, map_count);
-    VfsRelease* releases = arena_alloc_array(temp.arena, VfsRelease, map_count);
-    u64 victim_count = 0;
-    for_each_hashmap(&self->handle_map, key, val) {
-        VfsHandleData* hd = *val;
-        if (hd && hd->mount == mount) {
-            victims[victim_count] = *key;
-            victim_jobs[victim_count] = vfs_handle_jobs(hd->job_handle, hd->last_job);
-            victim_count++;
-        }
+
+    u64 victim_count = vfs_collect_handles_locked(self, vfs_handle_is_on_mount, mount, found);
+    // Id and jobs copied out here, not the pointers: a concurrent vfs_close() on a leaked handle may free
+    // one of these between the unlock below and the free pass further down.
+    for (u64 i = 0; i < victim_count; i++) {
+        victims[i] = found[i]->id;
+        victim_jobs[i] = vfs_handle_jobs(found[i]->job_handle, found[i]->last_job);
     }
+    VfsReleaseList releases = vfs_release_list_new(temp.arena, victim_count);
     mutex_unlock(&self->handle_lock);
 
     // Drain this mount's in-flight ops before its tree, strings and arena are destroyed. fl_jobs_wait()
@@ -1305,7 +1358,9 @@ void vfs_mount_close(FlVfsMount* mount) {
     for (u64 i = 0; i < victim_count; i++) {
         VfsHandleData** victim_ptr = hashmap_get(&self->handle_map, victims[i]);
         VfsHandleData* victim_data = victim_ptr ? *victim_ptr : nullptr;
-        releases[i] = victim_data ? vfs_free_handle_locked(self, victim_data) : (VfsRelease) { 0 };
+        if (victim_data) {
+            vfs_release_list_push(&releases, vfs_free_handle_locked(self, victim_data));
+        }
     }
 
     if (mount->watching_enabled && mount->watcher_handle != 0) {
@@ -1346,9 +1401,7 @@ void vfs_mount_close(FlVfsMount* mount) {
     // (vfs_mount_with_options acquires mount_lock -> handle_lock, so we must respect that order)
     mutex_unlock(&self->handle_lock);
 
-    for (u64 i = 0; i < victim_count; i++) {
-        vfs_run_release(releases[i]);
-    }
+    vfs_release_list_run_all(&releases);
 
     mutex_lock(&self->mount_lock);
 
