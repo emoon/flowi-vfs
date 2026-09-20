@@ -148,10 +148,16 @@ struct FlVfsMount {
 
 struct VfsHandleData {
     FlJobHandle job_handle;
-    // job_handle 0 means "no job, result already published" everywhere except between vfs_dispatch scheduling
-    // the job and storing its handle. This marks that window so a handle whose job is queued or running is not
-    // mistaken for a finished one.
-    _Atomic bool dispatch_pending;
+    // Open scheduling windows on this handle: a job that can reach it has been created outside handle_lock
+    // but is not yet recorded in job_handle/last_job, so those two fields understate the work outstanding.
+    // vfs_dispatch raises it on the handle it is dispatching; vfs_chain_file_op raises it on the *file*
+    // handle a read or write chains onto, which is the handle that would otherwise be freed while the
+    // chained job still resolves its id. Nonzero reads as "not finished" to vfs_close, vfs_wait_all and the
+    // reclaim sweep, so a close landing in the window defers instead of freeing.
+    //
+    // A count, not a flag: chains onto one file handle can nest and overlap, and the inner one must not
+    // clear the outer one's guard.
+    _Atomic u32 pending_dispatches;
     // Closed while its job was still running. Reads as absent to every caller and is freed by the reclaim
     // sweep once the job has finished; until then the job keeps its raw pointer. Written under handle_lock.
     bool closed;

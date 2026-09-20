@@ -67,7 +67,7 @@ typedef struct VfsHandleSnapshot {
     int depth;
     u32 snapshot_version;
     bool ready;            // Job finished (or none scheduled)
-    bool dispatch_pending; // Job scheduled but its handle not stored yet, so job_handle below reads 0
+    bool dispatch_pending; // A job that can reach this handle is scheduled but not yet recorded on it
     void* result_data;
     VfsOpStatus error_status;
     VfsPluginEntry* plugin_entry;
@@ -139,7 +139,7 @@ static bool vfs_snapshot_handle(FlVfsHandle handle, VfsHandleSnapshot* out) {
     out->mount = handle_data->mount;
     out->path = handle_data->path;
     out->depth = handle_data->depth;
-    out->dispatch_pending = atomic_load_explicit(&handle_data->dispatch_pending, memory_order_acquire);
+    out->dispatch_pending = atomic_load_explicit(&handle_data->pending_dispatches, memory_order_acquire) != 0;
     out->ready = !out->dispatch_pending
                  && ((handle_data->job_handle == 0)
                      || (fl_jobs_is_finished(handle_data->job_handle) != FlJobsResult_NotFinished));
@@ -807,7 +807,7 @@ static void vfs_reclaim_closed_handles(VfsState* self) {
     for_each_hashmap(&self->handle_map, key, val) {
         (void)key;
         VfsHandleData* hd = *val;
-        if (hd && hd->closed && !atomic_load_explicit(&hd->dispatch_pending, memory_order_acquire)
+        if (hd && hd->closed && atomic_load_explicit(&hd->pending_dispatches, memory_order_acquire) == 0
             && vfs_jobs_finished(vfs_handle_jobs(hd->job_handle, hd->last_job))) {
             done[done_count++] = hd;
         }
@@ -863,8 +863,9 @@ void vfs_close(FlVfsHandle handle) {
         return;
     }
 
-    // A pending dispatch has its job scheduled and its handle not stored yet, so it counts as running.
-    bool finished = !atomic_load_explicit(&handle_data->dispatch_pending, memory_order_acquire)
+    // An open scheduling window has a job that can reach this handle created but not yet recorded on it,
+    // so it counts as running - for a file handle that covers a read or write mid-chain onto it.
+    bool finished = atomic_load_explicit(&handle_data->pending_dispatches, memory_order_acquire) == 0
                     && vfs_jobs_finished(vfs_handle_jobs(handle_data->job_handle, handle_data->last_job));
 
     if (!finished) {
@@ -968,7 +969,7 @@ void vfs_dispatch(FlVfsHandle handle) {
     if (handle_data) {
         // Before scheduling: the worker can reach the job, and a caller can observe the handle, while
         // job_handle below is still 0.
-        atomic_store_explicit(&handle_data->dispatch_pending, true, memory_order_release);
+        atomic_fetch_add_explicit(&handle_data->pending_dispatches, 1, memory_order_release);
     }
     mutex_unlock(&self->handle_lock);
 
@@ -984,7 +985,7 @@ void vfs_dispatch(FlVfsHandle handle) {
     if (vfs_lookup_handle_locked(self, handle) == handle_data) {
         handle_data->job_handle = job;
         handle_data->last_job = job;
-        atomic_store_explicit(&handle_data->dispatch_pending, false, memory_order_release);
+        atomic_fetch_sub_explicit(&handle_data->pending_dispatches, 1, memory_order_release);
     }
     mutex_unlock(&self->handle_lock);
 }
@@ -1060,6 +1061,12 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
     FlVfsMount* mount = file_data->mount;
     FlJobHandle chain_after = file_data->last_job;
 
+    // Raised before the unlock and lowered only once this op's job is recorded as the file handle's
+    // last_job. Across that window last_job still names the *previous* op, so a vfs_close landing here with
+    // that predecessor finished would otherwise see an idle handle and free VfsHandleData, its result buffer
+    // and its plugin_file_handle - all of which the job scheduled below still reaches through file_handle.
+    atomic_fetch_add_explicit(&file_data->pending_dispatches, 1, memory_order_release);
+
     VfsHandleData* op_handle = pool_alloc(&self->handle_pool);
     memory_zero(op_handle, sizeof(VfsHandleData));
 
@@ -1100,11 +1107,19 @@ static FlVfsHandle vfs_chain_file_op(FlVfsHandle file_handle, const VfsFileOpPar
     op_handle->last_job = op_handle->job_handle;
 
     mutex_lock(&self->handle_lock);
+    // The guard above keeps the file handle in the map for the whole window - a close inside it defers
+    // rather than frees - so this lookup finds it whether or not it was closed meanwhile.
     VfsHandleData* file_now = vfs_lookup_handle_locked(self, file_handle);
-    if (file_now && !chain_refused) {
-        // Next operation (or close) chains after this op; 0 for the synchronous path. A refused chain never
-        // ran, so the predecessor it could not wait for is still what the file handle must wait for.
-        file_now->last_job = op_handle->job_handle;
+    if (file_now) {
+        if (!chain_refused) {
+            // Next operation (or close) chains after this op; 0 for the synchronous path. A refused chain
+            // never ran, so the predecessor it could not wait for is still what the file handle must wait
+            // for.
+            file_now->last_job = op_handle->job_handle;
+        }
+        // Lowered last: from here last_job covers this op, so the handle is free to be judged idle again.
+        // A deferred close left the handle closed, and the reclaim sweep takes it once this reaches 0.
+        atomic_fetch_sub_explicit(&file_now->pending_dispatches, 1, memory_order_release);
     }
     hashmap_insert(&self->handle_map, op_id, op_handle);
     mutex_unlock(&self->handle_lock);
