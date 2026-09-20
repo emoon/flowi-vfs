@@ -58,13 +58,16 @@ impl Payload for VfsData {
 
 /// One entry of a completed listing, as owned values. The borrowing view over it is
 /// [`Entry`]; this is the storage [`FileList`] keeps.
+///
+/// `pub(super)` so the test fake can hold the same struct rather than a field-for-field
+/// copy of it: the fake's listing storage is exactly what a real listing drains into.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct OwnedEntry {
-    name: String,
-    size: i64,
-    attributes: u32,
-    is_directory: bool,
-    is_archive: bool,
+pub(super) struct OwnedEntry {
+    pub(super) name: String,
+    pub(super) size: i64,
+    pub(super) attributes: u32,
+    pub(super) is_directory: bool,
+    pub(super) is_archive: bool,
 }
 
 /// A completed directory listing, owning its entries.

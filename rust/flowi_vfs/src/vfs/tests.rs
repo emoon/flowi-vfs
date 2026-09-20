@@ -6,6 +6,7 @@
 //! The fake itself is [`super::fake`]; this file is cases only.
 
 use super::fake::*;
+use super::mount::MOUNT_ERRORS;
 use super::*;
 use std::sync::Arc;
 
@@ -35,37 +36,19 @@ fn init_forwards_the_arena_and_reports_refusal() {
 
 #[test]
 fn mount_maps_every_error_status_to_its_own_variant() {
-    for (status, expected) in [
-        (
-            sys::VfsMountErrorStatus::InvalidPath,
-            MountError::InvalidPath,
-        ),
-        (
-            sys::VfsMountErrorStatus::PluginNotFound,
-            MountError::PluginNotFound,
-        ),
-        (
-            sys::VfsMountErrorStatus::MountFailed,
-            MountError::MountFailed,
-        ),
-        (
-            sys::VfsMountErrorStatus::OutOfMemory,
-            MountError::OutOfMemory,
-        ),
-        (
-            sys::VfsMountErrorStatus::NotInitialized,
-            MountError::NotInitialized,
-        ),
-    ] {
+    // The same table MountError::from_status and its Display are generated from, so a
+    // status that gained no mapping cannot pass here either.
+    for (status, expected, text) in MOUNT_ERRORS {
         reset_fake(FakeState {
-            mount_status: status,
+            mount_status: *status,
             ..Default::default()
         });
         assert_eq!(
             Vfs::mount("/anything").err(),
-            Some(expected),
+            Some(*expected),
             "status {status:?}"
         );
+        assert_eq!(expected.to_string(), *text, "status {status:?}");
     }
 }
 

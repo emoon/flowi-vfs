@@ -37,49 +37,81 @@ impl MountOptions<'_> {
 /// This is the refusal: the request never became a mount. A mount that opens
 /// and then fails while its driver resolves it is a live [`Mount`] reporting
 /// [`MountStatus::Error`], not an error here.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum MountError {
-    /// The source path is empty or malformed.
-    InvalidPath,
-    /// No VFS driver claimed the source.
-    PluginNotFound,
-    /// A driver claimed it and failed to open it - missing, unreadable, denied.
-    MountFailed,
-    /// Allocation failed.
-    OutOfMemory,
-    /// The VFS has not been initialized.
-    NotInitialized,
+///
+/// The variants, their C statuses and their messages are one list below, which
+/// generates all three, so a variant cannot exist without a status to arrive as and
+/// something to say.
+#[doc(inline)]
+pub use self::mount_error_decl::MountError;
+
+/// Generates the enum, its [`Display`](core::fmt::Display), the status mapping and the
+/// table the test iterates, from one list of `Variant = Status, "message";`.
+///
+/// Both generated matches stay exhaustive, which is the point: a new
+/// `FlVfsMountErrorStatus` from the C side fails to compile here until the list names
+/// it, rather than quietly mapping to [`None`] and reading as a success.
+macro_rules! mount_errors {
+    ($( $(#[$doc:meta])* $variant:ident = $status:ident, $text:literal; )*) => {
+        /// Why a mount could not be opened - one variant per non-success
+        /// FlVfsMountErrorStatus.
+        ///
+        /// This is the refusal: the request never became a mount. A mount that opens
+        /// and then fails while its driver resolves it is a live [`Mount`] reporting
+        /// [`MountStatus::Error`], not an error here.
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        pub enum MountError {
+            $( $(#[$doc])* $variant, )*
+        }
+
+        impl core::fmt::Display for MountError {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(match self {
+                    $( MountError::$variant => $text, )*
+                })
+            }
+        }
+
+        impl MountError {
+            /// Map a mount result's status. Success yields [`None`] - the caller has a
+            /// mount pointer to use instead.
+            pub(super) fn from_status(status: sys::VfsMountErrorStatus) -> Option<MountError> {
+                match status {
+                    sys::VfsMountErrorStatus::Success => None,
+                    $( sys::VfsMountErrorStatus::$status => Some(MountError::$variant), )*
+                }
+            }
+        }
+
+        /// Every refusal as (status, variant, message), for the test that proves the
+        /// mapping is total.
+        #[cfg(test)]
+        pub(crate) const MOUNT_ERRORS: &[(sys::VfsMountErrorStatus, MountError, &str)] = &[
+            $( (sys::VfsMountErrorStatus::$status, MountError::$variant, $text), )*
+        ];
+    };
 }
 
-impl core::fmt::Display for MountError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let text = match self {
-            MountError::InvalidPath => "invalid source path",
-            MountError::PluginNotFound => "no VFS driver for this source",
-            MountError::MountFailed => "the driver could not open the source",
-            MountError::OutOfMemory => "out of memory",
-            MountError::NotInitialized => "the VFS is not initialized",
-        };
-        f.write_str(text)
+mod mount_error_decl {
+    use super::*;
+
+    mount_errors! {
+        /// The source path is empty or malformed.
+        InvalidPath = InvalidPath, "invalid source path";
+        /// No VFS driver claimed the source.
+        PluginNotFound = PluginNotFound, "no VFS driver for this source";
+        /// A driver claimed it and failed to open it - missing, unreadable, denied.
+        MountFailed = MountFailed, "the driver could not open the source";
+        /// Allocation failed.
+        OutOfMemory = OutOfMemory, "out of memory";
+        /// The VFS has not been initialized.
+        NotInitialized = NotInitialized, "the VFS is not initialized";
     }
 }
+
+#[cfg(test)]
+pub(super) use self::mount_error_decl::MOUNT_ERRORS;
 
 impl std::error::Error for MountError {}
-
-impl MountError {
-    /// Map a mount result's status. Success yields [`None`] - the caller has a
-    /// mount pointer to use instead.
-    fn from_status(status: sys::VfsMountErrorStatus) -> Option<MountError> {
-        match status {
-            sys::VfsMountErrorStatus::Success => None,
-            sys::VfsMountErrorStatus::InvalidPath => Some(MountError::InvalidPath),
-            sys::VfsMountErrorStatus::PluginNotFound => Some(MountError::PluginNotFound),
-            sys::VfsMountErrorStatus::MountFailed => Some(MountError::MountFailed),
-            sys::VfsMountErrorStatus::OutOfMemory => Some(MountError::OutOfMemory),
-            sys::VfsMountErrorStatus::NotInitialized => Some(MountError::NotInitialized),
-        }
-    }
-}
 
 /// Mount readiness - the coarse state [`Mount::status`] reports.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

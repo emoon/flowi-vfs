@@ -57,6 +57,7 @@ pub(crate) mod ffi;
 mod mapped;
 mod mount;
 mod payload;
+mod slots;
 #[cfg(test)]
 mod tests;
 

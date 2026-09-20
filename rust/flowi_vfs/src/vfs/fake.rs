@@ -2,103 +2,51 @@
 //! cfg(test). Test-only and crate-private in a cfg(test) build, so it does not
 //! exist at all in a shipped one.
 //!
-//! The fixture the cases drive it with lives here too - the per-thread [`FakeState`],
-//! the slot implementations and [`fake_table`] - so `mod tests` is cases only.
+//! The table itself is generated from [`vfs_slots!`](super::slots::vfs_slots), so a slot cannot
+//! exist in [`super::ffi`] without existing here. The fixture the cases drive it with lives here too -
+//! the per-thread [`FakeState`], the slot implementations and `fake_table` - so `mod tests` is cases
+//! only.
 
+use super::payload::OwnedEntry;
+use super::slots::vfs_slots;
 use super::*;
 use std::cell::RefCell;
 
-/// One slot per C entry point. Plain fn pointers rather than Options - the
-/// unfilled slots panic instead.
-#[derive(Copy, Clone)]
-pub(crate) struct VfsApi {
-    pub(crate) vfs_init: unsafe extern "C" fn(*mut sys::Arena) -> bool,
-    pub(crate) vfs_mount_with_options:
-        unsafe extern "C" fn(sys::RawStr, sys::VfsMountOptions) -> sys::VfsMountResult,
-    pub(crate) vfs_mount_close: unsafe extern "C" fn(*mut sys::FlVfsMount),
-    pub(crate) vfs_mount_get_job_handle:
-        unsafe extern "C" fn(*mut sys::FlVfsMount) -> sys::JobHandle,
-    pub(crate) vfs_mount_is_ready: unsafe extern "C" fn(*mut sys::FlVfsMount) -> bool,
-    pub(crate) vfs_mount_get_status:
-        unsafe extern "C" fn(*mut sys::FlVfsMount) -> sys::VfsMountStatus,
-    pub(crate) vfs_mount_get_info: unsafe extern "C" fn(*mut sys::FlVfsMount) -> sys::VfsMountInfo,
-    pub(crate) vfs_mount_enable_watching: unsafe extern "C" fn(*mut sys::FlVfsMount) -> bool,
-    pub(crate) vfs_mount_read_all_with_options: unsafe extern "C" fn(
-        *mut sys::FlVfsMount,
-        sys::RawStr,
-        sys::VfsReadCallback,
-        *mut c_void,
-        sys::VfsReleaseCallback,
-        u32,
-    ) -> u32,
-    pub(crate) vfs_mount_open: unsafe extern "C" fn(*mut sys::FlVfsMount, sys::RawStr, u32) -> u32,
-    pub(crate) vfs_read: unsafe extern "C" fn(u32, *mut c_void, i64) -> u32,
-    pub(crate) vfs_get_listing: unsafe extern "C" fn(*mut sys::FlVfsMount, sys::RawStr, i32) -> u32,
-    pub(crate) vfs_is_ready: unsafe extern "C" fn(u32) -> bool,
-    pub(crate) vfs_wait: unsafe extern "C" fn(u32),
-    pub(crate) vfs_get_data: unsafe extern "C" fn(u32) -> sys::VfsData,
-    pub(crate) vfs_get_file_list: unsafe extern "C" fn(u32) -> sys::VfsFileList,
-    pub(crate) vfs_close: unsafe extern "C" fn(u32),
-}
-
-/// Slot fillers for a table under construction: a call the scenario under test
-/// is not supposed to make fails loudly rather than being quietly stubbed out.
-mod unimplemented_slots {
-    use super::*;
-
-    macro_rules! unimplemented_slot {
-        ($name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?) => {
-            pub(super) unsafe extern "C" fn $name($(_: $ty),*) $(-> $ret)? {
-                unimplemented!(concat!("the test's VFS table has no ", stringify!($name)))
-            }
-        };
-    }
-
-    unimplemented_slot!(init(a: *mut sys::Arena) -> bool);
-    unimplemented_slot!(mount_with_options(a: sys::RawStr, b: sys::VfsMountOptions) -> sys::VfsMountResult);
-    unimplemented_slot!(mount_close(a: *mut sys::FlVfsMount));
-    unimplemented_slot!(mount_get_job_handle(a: *mut sys::FlVfsMount) -> sys::JobHandle);
-    unimplemented_slot!(mount_is_ready(a: *mut sys::FlVfsMount) -> bool);
-    unimplemented_slot!(mount_get_status(a: *mut sys::FlVfsMount) -> sys::VfsMountStatus);
-    unimplemented_slot!(mount_get_info(a: *mut sys::FlVfsMount) -> sys::VfsMountInfo);
-    unimplemented_slot!(mount_enable_watching(a: *mut sys::FlVfsMount) -> bool);
-    unimplemented_slot!(mount_read_all_with_options(a: *mut sys::FlVfsMount, b: sys::RawStr, c: sys::VfsReadCallback, d: *mut c_void, e: sys::VfsReleaseCallback, f: u32) -> u32);
-    unimplemented_slot!(mount_open(a: *mut sys::FlVfsMount, b: sys::RawStr, c: u32) -> u32);
-    unimplemented_slot!(read(a: u32, b: *mut c_void, c: i64) -> u32);
-    unimplemented_slot!(get_listing(a: *mut sys::FlVfsMount, b: sys::RawStr, c: i32) -> u32);
-    unimplemented_slot!(is_ready(a: u32) -> bool);
-    unimplemented_slot!(wait(a: u32));
-    unimplemented_slot!(get_data(a: u32) -> sys::VfsData);
-    unimplemented_slot!(get_file_list(a: u32) -> sys::VfsFileList);
-    unimplemented_slot!(close(a: u32));
-}
-
-impl VfsApi {
-    /// A table every slot of which panics. The base a test builds its fake on,
-    /// so it fills in only the calls its scenario actually drives.
-    pub(crate) fn unimplemented() -> VfsApi {
-        use unimplemented_slots as stub;
-        VfsApi {
-            vfs_init: stub::init,
-            vfs_mount_with_options: stub::mount_with_options,
-            vfs_mount_close: stub::mount_close,
-            vfs_mount_get_job_handle: stub::mount_get_job_handle,
-            vfs_mount_is_ready: stub::mount_is_ready,
-            vfs_mount_get_status: stub::mount_get_status,
-            vfs_mount_get_info: stub::mount_get_info,
-            vfs_mount_enable_watching: stub::mount_enable_watching,
-            vfs_mount_read_all_with_options: stub::mount_read_all_with_options,
-            vfs_mount_open: stub::mount_open,
-            vfs_read: stub::read,
-            vfs_get_listing: stub::get_listing,
-            vfs_is_ready: stub::is_ready,
-            vfs_wait: stub::wait,
-            vfs_get_data: stub::get_data,
-            vfs_get_file_list: stub::get_file_list,
-            vfs_close: stub::close,
+/// Generates everything about the fake's table that is derivable from the slot list: the struct of
+/// function pointers, a panicking stub per slot, and the all-stubs base a test builds on. A call the
+/// scenario under test is not supposed to make fails loudly rather than being quietly stubbed out.
+macro_rules! define_fake_api {
+    ($($name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?;)*) => {
+        /// One slot per C entry point. Plain fn pointers rather than Options - the
+        /// unfilled slots panic instead.
+        #[derive(Copy, Clone)]
+        pub(crate) struct VfsApi {
+            $(pub(crate) $name: unsafe extern "C" fn($($ty),*) $(-> $ret)?,)*
         }
-    }
+
+        /// Slot fillers for a table under construction.
+        mod unimplemented_slots {
+            use super::*;
+            $(
+                pub(super) unsafe extern "C" fn $name($(_: $ty),*) $(-> $ret)? {
+                    unimplemented!(concat!("the test's VFS table has no ", stringify!($name)))
+                }
+            )*
+        }
+
+        impl VfsApi {
+            /// A table every slot of which panics. The base a test builds its fake on,
+            /// so it fills in only the calls its scenario actually drives.
+            pub(crate) fn unimplemented() -> VfsApi {
+                VfsApi {
+                    $($name: unimplemented_slots::$name,)*
+                }
+            }
+        }
+    };
 }
+
+vfs_slots!(define_fake_api);
 
 thread_local! {
     /// The table this thread's VFS calls land in. Per-thread so tests running
@@ -120,16 +68,6 @@ pub(crate) fn table() -> VfsApi {
 // The fixture the cases drive the table with: the per-thread FakeState that stands in for an
 // async operation, the slot implementations that read and write it, and fake_table().
 
-/// One entry the fake listing reports.
-#[derive(Clone)]
-pub(super) struct FakeEntry {
-    pub(super) name: String,
-    pub(super) size: i64,
-    pub(super) attributes: u32,
-    pub(super) is_directory: bool,
-    pub(super) is_archive: bool,
-}
-
 pub(super) struct FakeState {
     /// is_ready returns false this many polls, then true.
     pub(super) polls_until_ready: i32,
@@ -144,7 +82,7 @@ pub(super) struct FakeState {
     /// still holding its untouched transform.
     pub(super) hold_callback: bool,
     /// Entries get_file_list reports.
-    pub(super) entries: Vec<FakeEntry>,
+    pub(super) entries: Vec<OwnedEntry>,
     /// What vfs_mount_with_options reports.
     pub(super) mount_status: sys::VfsMountErrorStatus,
     /// When set, vfs_mount_with_options hands back a null mount whatever its status.
@@ -520,8 +458,8 @@ unsafe extern "C" fn fake_mount_get_job_handle(_mount: *mut sys::FlVfsMount) -> 
 // -----------------------------------------------------------------------
 // Owning listings.
 
-pub(super) fn entry(name: &str, is_directory: bool) -> FakeEntry {
-    FakeEntry {
+pub(super) fn entry(name: &str, is_directory: bool) -> OwnedEntry {
+    OwnedEntry {
         name: name.to_string(),
         size: if is_directory { 0 } else { 42 },
         attributes: 0x8000,
