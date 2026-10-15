@@ -1389,23 +1389,24 @@ static void vfs_free_mount_victims(VfsState* self, const VfsMountVictim* victims
     }
 }
 
-// True when mount is still in the mount list. A mount that is not is a double-close or a use-after-free.
-static bool vfs_mount_is_listed(VfsState* self, const FlVfsMount* mount) {
+// Takes mount off the mount list, in the same locked step that checks it is listed, and reports whether it was.
+// A mount that is not is a double-close or a use-after-free. Once it is off the list, vfs_update and a second
+// close can no longer reach it, so the rest of the close runs on a mount no other thread can find.
+static bool vfs_mount_unlist(VfsState* self, FlVfsMount* mount) {
     mutex_lock_auto(&self->mount_lock);
     for_each_list(m, self->mount_first) {
         if (m == mount) {
+            sll_queue_remove(self->mount_first, self->mount_last, mount);
             return true;
         }
     }
     return false;
 }
 
-// Unlinks the mount from the list and destroys the storage it owns. Everything that could still reach it
-// has been drained by now.
+// Destroys the storage an unlisted mount owns. Everything that could still reach it has been drained by now.
+// mount_lock guards the pool, which vfs_mount_with_options allocates from under the same lock.
 static void vfs_destroy_mount(VfsState* self, FlVfsMount* mount) {
     mutex_lock_auto(&self->mount_lock);
-
-    sll_queue_remove(self->mount_first, self->mount_last, mount);
 
     // Jobs were drained above, so no other thread can hold tree_lock; destroy it
     // before the struct is zeroed and returned to the pool.
@@ -1425,7 +1426,7 @@ void vfs_mount_close(FlVfsMount* mount) {
     FL_VALIDATE(self != nullptr);
     FL_VALIDATE(mount != nullptr);
 
-    if (!vfs_mount_is_listed(self, mount)) {
+    if (!vfs_mount_unlist(self, mount)) {
         logc_error(VFS_ID, "vfs_mount_close: mount %p not in list (double-close or use-after-free)", (void*)mount);
         return;
     }
@@ -1512,23 +1513,10 @@ void vfs_update(void) {
 
     arena_scratch_auto(temp);
 
-    // Collect mounts while holding mount_lock to avoid race with vfs_mount_with_options
-    u32 mount_count = 0;
+    // Walk the mounts under mount_lock. vfs_mount_close takes a mount off the list under this lock before
+    // tearing it down, so every mount reached here stays alive and out of a close until the walk ends.
     mutex_lock(&self->mount_lock);
-    for_each_list(m, self->mount_first) {
-        mount_count++;
-    }
-
-    FlVfsMount** mounts = arena_alloc_array(temp.arena, FlVfsMount*, mount_count);
-    u32 mount_idx = 0;
-    for_each_list(m, self->mount_first) {
-        mounts[mount_idx++] = m;
-    }
-    mutex_unlock(&self->mount_lock);
-
-    // Now process file watchers without holding mount_lock
-    for_count(j, mount_count) {
-        FlVfsMount* mount = mounts[j];
+    for_each_list(mount, self->mount_first) {
         // Use tree_lock to safely read watcher fields (set by op_mount)
         mutex_lock(&mount->tree_lock);
         bool watching = mount->watching_enabled;
@@ -1539,6 +1527,7 @@ void vfs_update(void) {
             process_file_watcher_changes(mount, watcher, temp.arena);
         }
     }
+    mutex_unlock(&self->mount_lock);
 
     vfs_reclaim_closed_handles(self);
 }
