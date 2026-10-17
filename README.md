@@ -31,7 +31,10 @@ registered later. The archive drivers are optional and off-able:
 
 Each vendors the third-party library behind it (see
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)) and is compiled only when its option is
-on. flowi itself turns all three off: `libflowi.so` has never contained them.
+on. flowi defaults all three off, so `libflowi.so` contains none of them; an embedder that
+links flowi statically into its own executable can turn them on. An embedder that already
+builds one of the libraries can define its `archive_static`, `lhasa` or `unlzx` target
+before adding this, and the driver links that instead of the vendored copy.
 
 ## Building
 
