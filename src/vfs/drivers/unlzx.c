@@ -44,6 +44,10 @@ typedef struct UnlzxHandle {
     FlArena* cache_arena;           // Arena for all cached data (nullptr until first listing)
     VfsCachedEntry* cached_entries; // Linked list head
     uint32_t cached_entry_count;    // Number of cached entries
+
+    // A read with no path continues through the handle's own entry; the stream opens on the first such read and
+    // decompresses straight into each caller's buffer.
+    UnlzxStream* stream;
 } UnlzxHandle;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -180,6 +184,7 @@ static FlVfsOpenResult unlzx_open(void* driver_instance, void* parent_handle, Fl
         handle->cache_arena = nullptr;
         handle->cached_entries = nullptr;
         handle->cached_entry_count = 0;
+        handle->stream = nullptr;
 
         return (FlVfsOpenResult) { .handle = handle, .error = { .vfs_status = FlVfsStatus_Success } };
     }
@@ -220,6 +225,35 @@ static FlString resolve_target_path(UnlzxHandle* handle, FlString path) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Continue reading the handle's own entry from where the last read stopped, 0 bytes at its end
+
+static FlVfsReadResult unlzx_read_next(UnlzxHandle* handle, uint8_t* buffer, int64_t size) {
+    if (!handle->stream) {
+        arena_scratch_auto(temp);
+        const UnlzxEntry* entry = unlzx_find_entry(handle->archive, string_to_cstr(temp.arena, handle->target_path));
+        if (!entry) {
+            return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = FlVfsStatus_FileNotFound } };
+        }
+
+        UnlzxError err = unlzx_stream_open(handle->archive, entry, &handle->stream);
+        if (err != UNLZX_OK) {
+            fl_log_error("UnLZX extraction failed: %d", err);
+            FlVfsStatus status = err == UNLZX_ERR_OUT_OF_MEMORY ? FlVfsStatus_OutOfMemory : FlVfsStatus_ArchiveError;
+            return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = status } };
+        }
+    }
+
+    size_t bytes_read = 0;
+    UnlzxError err = unlzx_stream_read(handle->stream, buffer, (size_t)size, &bytes_read);
+    if (err != UNLZX_OK) {
+        fl_log_error("UnLZX extraction failed: %d", err);
+        return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = FlVfsStatus_ArchiveError } };
+    }
+
+    return (FlVfsReadResult) { .bytes_read = (int64_t)bytes_read, .error = { .vfs_status = FlVfsStatus_Success } };
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Read file contents from archive
 
 static FlVfsReadResult unlzx_read(void* driver_instance, void* handle_ptr, FlString path, uint8_t* buffer,
@@ -243,6 +277,14 @@ static FlVfsReadResult unlzx_read(void* driver_instance, void* handle_ptr, FlStr
         return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = FlVfsStatus_PathInvalid } };
     }
 
+    if (size < 0) {
+        return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = FlVfsStatus_GenericError } };
+    }
+
+    if (path.length == 0) {
+        return unlzx_read_next(handle, buffer, size);
+    }
+
     arena_scratch_auto(temp);
     const char* target_cstr = string_to_cstr(temp.arena, target_path);
 
@@ -251,7 +293,7 @@ static FlVfsReadResult unlzx_read(void* driver_instance, void* handle_ptr, FlStr
         return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = FlVfsStatus_FileNotFound } };
     }
 
-    if (size < 0 || (uint64_t)size < entry->unpack_size) {
+    if ((uint64_t)size < entry->unpack_size) {
         return (FlVfsReadResult) { .bytes_read = -1, .error = { .vfs_status = FlVfsStatus_GenericError } };
     }
 
@@ -347,6 +389,7 @@ static FlVfsOpenResult unlzx_clone(void* driver_instance, void* handle_ptr) {
     handle->cache_arena = nullptr;
     handle->cached_entries = nullptr;
     handle->cached_entry_count = 0;
+    handle->stream = nullptr;
 
     // Create new archive instance from same memory
     handle->archive = unlzx_open_memory(handle->memory_buffer, (size_t)handle->memory_size);
@@ -382,6 +425,7 @@ static void unlzx_vfs_close(void* driver_instance, void* handle_ptr) {
         arena_destroy(handle->cache_arena);
     }
 
+    unlzx_stream_close(handle->stream);
     string_free(handle->target_path);
     string_free(handle->archive_path);
 
@@ -429,6 +473,7 @@ static FlVfsOpenResult unlzx_vfs_open_memory(void* driver_instance, const uint8_
     handle->cache_arena = nullptr;
     handle->cached_entries = nullptr;
     handle->cached_entry_count = 0;
+    handle->stream = nullptr;
 
     handle->archive = unlzx_open_memory(data, (size_t)size);
     if (!handle->archive) {

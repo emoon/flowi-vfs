@@ -51,11 +51,27 @@ typedef enum UnlzxError {
 } UnlzxError;
 
 /*
+ * Where the archive, and every stream opened on it, get their memory.
+ * alloc returns NULL on failure; free is never passed NULL.
+ */
+typedef struct UnlzxAllocator {
+    void* (*alloc)(void* user, size_t size);
+    void (*free)(void* user, void* ptr);
+    void* user;
+} UnlzxAllocator;
+
+/*
  * Open an LZX archive from memory buffer.
  * The data pointer must remain valid for the lifetime of the archive.
  * Returns NULL on error, check unlzx_get_last_error() for details.
  */
 UnlzxArchive* unlzx_open_memory(const uint8_t* data, size_t size);
+
+/*
+ * As unlzx_open_memory, allocating through allocator (malloc and free when NULL).
+ */
+UnlzxArchive* unlzx_open_memory_with_allocator(const uint8_t* data, size_t size,
+                                               const UnlzxAllocator* allocator);
 
 /*
  * Get the number of entries in the archive.
@@ -82,6 +98,24 @@ const UnlzxEntry* unlzx_find_entry(UnlzxArchive* archive, const char* filename);
  */
 UnlzxError unlzx_extract_entry(UnlzxArchive* archive, const UnlzxEntry* entry,
                                 uint8_t* buffer, size_t buffer_size);
+
+/*
+ * Streaming extraction: decompresses an entry in pieces of the caller's size,
+ * keeping only fixed-size decoder state however large the entry is. Each
+ * stream decodes independently of the archive and of other streams, but reads
+ * the archive's data, so it must be closed before the archive.
+ *
+ * unlzx_stream_open sets *stream on success.
+ * unlzx_stream_read decompresses up to size bytes into buffer and sets
+ * *bytes_read, which is 0 once the whole entry has been read. The CRC is
+ * checked by the read that produces the entry's last byte; a mismatch fails
+ * that read. After an error every later read returns the same error.
+ */
+typedef struct UnlzxStream UnlzxStream;
+
+UnlzxError unlzx_stream_open(UnlzxArchive* archive, const UnlzxEntry* entry, UnlzxStream** stream);
+UnlzxError unlzx_stream_read(UnlzxStream* stream, uint8_t* buffer, size_t size, size_t* bytes_read);
+void unlzx_stream_close(UnlzxStream* stream);
 
 /*
  * Get the last error code.

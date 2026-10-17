@@ -83,7 +83,30 @@ struct UnlzxArchive {
     uint32_t sum;  /* CRC accumulator */
 
     UnlzxError last_error;
+
+    UnlzxAllocator allocator;
 };
+
+/* ------------------------------------------------------------------------ */
+/* Allocation */
+
+static void* default_alloc(void* user, size_t size) {
+    (void)user;
+    return malloc(size);
+}
+
+static void default_free(void* user, void* ptr) {
+    (void)user;
+    free(ptr);
+}
+
+static void* alloc_zeroed(const UnlzxAllocator* allocator, size_t size) {
+    void* ptr = allocator->alloc(allocator->user, size);
+    if (ptr) {
+        memset(ptr, 0, size);
+    }
+    return ptr;
+}
 
 /* ------------------------------------------------------------------------ */
 /* CRC table */
@@ -557,137 +580,170 @@ static void decrunch(UnlzxArchive* ctx) {
 }
 
 /* ------------------------------------------------------------------------ */
-/* Extract a compressed entry to buffer */
+/* Resumable extraction of one entry. Only fixed-size decoder state is kept
+ * between reads, so an entry can be read in pieces of any size. */
 
-static UnlzxError extract_normal_to_buffer(UnlzxArchive* ctx, const UnlzxEntryInternal* entry,
-                                           uint8_t* output, size_t output_size) {
-    uint8_t* pos;
-    uint8_t* temp;
+typedef struct UnlzxStreamState {
+    uint32_t unpack_left;
+    uint32_t pack_left;
+    uint32_t crc;
+    uint8_t pack_mode;
+    uint8_t* pos;       /* Next decrunched byte not yet handed out */
+    UnlzxError error;   /* Sticky: a stream that failed stays failed */
+} UnlzxStreamState;
+
+struct UnlzxStream {
+    UnlzxArchive ctx;   /* Private decoder state over the archive's data */
+    UnlzxStreamState state;
+};
+
+static const UnlzxEntryInternal* find_internal_entry(UnlzxArchive* archive, const UnlzxEntry* entry) {
+    for (int i = 0; i < archive->entry_count; i++) {
+        if (&archive->entries[i].info == entry) {
+            return &archive->entries[i];
+        }
+    }
+    return NULL;
+}
+
+static UnlzxError stream_begin(UnlzxArchive* ctx, UnlzxStreamState* s, const UnlzxEntryInternal* entry) {
     uint32_t count;
-    uint32_t unpack_size;
-    uint32_t pack_size;
-    uint8_t* output_pos = output;
 
-    ctx->global_control = 0;
-    ctx->global_shift = -16;
-    ctx->last_offset = 1;
-    ctx->decrunch_length = 0;
+    memset(s, 0, sizeof(*s));
+    s->unpack_left = entry->info.unpack_size;
+    s->pack_left = entry->actual_pack_size;
+    s->crc = entry->info.crc;
+    s->pack_mode = entry->info.pack_mode;
 
-    for (count = 0; count < 8; count++)
-        ctx->offset_len[count] = 0;
-    for (count = 0; count < 768; count++)
-        ctx->literal_len[count] = 0;
+    if (s->pack_mode != 0 && s->pack_mode != 2) {
+        return UNLZX_ERR_UNSUPPORTED;
+    }
 
-    ctx->source_end = (ctx->source = ctx->read_buffer + READ_BUFFER_SIZE) - 1024;
-    pos = ctx->destination_end = ctx->destination = ctx->decrunch_buffer + 258 + 65536;
-
-    /* Seek to data position */
     if (mem_seek(ctx, entry->data_offset) != 0) {
         return UNLZX_ERR_EOF;
     }
 
-    unpack_size = entry->info.unpack_size;
-    pack_size = entry->actual_pack_size;
+    ctx->sum = 0;
 
-    while (unpack_size > 0) {
-        if (pos == ctx->destination) {
-            if (ctx->source >= ctx->source_end) {
-                temp = ctx->read_buffer;
-                count = (uint32_t)(temp - ctx->source + READ_BUFFER_SIZE);
-                if (count > 0) {
-                    do {
-                        *temp++ = *ctx->source++;
-                    } while (--count);
-                }
-                ctx->source = ctx->read_buffer;
-                count = (uint32_t)(ctx->source - temp + READ_BUFFER_SIZE);
+    if (s->pack_mode == 2) {
+        ctx->global_control = 0;
+        ctx->global_shift = -16;
+        ctx->last_offset = 1;
+        ctx->decrunch_length = 0;
 
-                if (pack_size < count) count = pack_size;
+        for (count = 0; count < 8; count++)
+            ctx->offset_len[count] = 0;
+        for (count = 0; count < 768; count++)
+            ctx->literal_len[count] = 0;
 
-                if ((uint32_t)mem_read(ctx, temp, count) != count) {
-                    return UNLZX_ERR_EOF;
-                }
-                pack_size -= count;
-
-                temp += count;
-                if (ctx->source >= temp) break;
-            }
-
-            if (ctx->decrunch_length <= 0) {
-                if (read_literal_table(ctx)) {
-                    return UNLZX_ERR_CORRUPT_DATA;
-                }
-            }
-
-            if (ctx->destination >= ctx->decrunch_buffer + 258 + 65536) {
-                count = (uint32_t)(ctx->destination - ctx->decrunch_buffer - 65536);
-                if (count > 0) {
-                    temp = (ctx->destination = ctx->decrunch_buffer) + 65536;
-                    do {
-                        *ctx->destination++ = *temp++;
-                    } while (--count);
-                }
-                pos = ctx->destination;
-            }
-            ctx->destination_end = ctx->destination + ctx->decrunch_length;
-            if (ctx->destination_end > ctx->decrunch_buffer + 258 + 65536)
-                ctx->destination_end = ctx->decrunch_buffer + 258 + 65536;
-            temp = ctx->destination;
-
-            decrunch(ctx);
-
-            ctx->decrunch_length -= (uint32_t)(ctx->destination - temp);
-        }
-
-        count = (uint32_t)(ctx->destination - pos);
-        if (count > unpack_size) count = unpack_size;
-
-        /* Copy to output buffer instead of CRC calculation */
-        if ((size_t)(output_pos - output) + count > output_size) {
-            return UNLZX_ERR_BUFFER_TOO_SMALL;
-        }
-        memcpy(output_pos, pos, count);
-        output_pos += count;
-
-        unpack_size -= count;
-        pos += count;
+        ctx->source_end = (ctx->source = ctx->read_buffer + READ_BUFFER_SIZE) - 1024;
+        s->pos = ctx->destination_end = ctx->destination = ctx->decrunch_buffer + 258 + 65536;
     }
 
     return UNLZX_OK;
 }
 
-/* ------------------------------------------------------------------------ */
-/* Extract a stored (uncompressed) entry to buffer */
-
-static UnlzxError extract_store_to_buffer(UnlzxArchive* ctx, const UnlzxEntryInternal* entry,
-                                          uint8_t* output, size_t output_size) {
-    uint32_t unpack_size;
+/* Decrunch the next run of bytes once everything decrunched so far is handed out. */
+static UnlzxError stream_decrunch(UnlzxArchive* ctx, UnlzxStreamState* s) {
+    uint8_t* temp;
     uint32_t count;
 
-    if (mem_seek(ctx, entry->data_offset) != 0) {
-        return UNLZX_ERR_EOF;
-    }
+    if (ctx->source >= ctx->source_end) {
+        temp = ctx->read_buffer;
+        count = (uint32_t)(temp - ctx->source + READ_BUFFER_SIZE);
+        if (count > 0) {
+            do {
+                *temp++ = *ctx->source++;
+            } while (--count);
+        }
+        ctx->source = ctx->read_buffer;
+        count = (uint32_t)(ctx->source - temp + READ_BUFFER_SIZE);
 
-    unpack_size = entry->info.unpack_size;
-    if (unpack_size > entry->actual_pack_size)
-        unpack_size = entry->actual_pack_size;
+        if (s->pack_left < count) count = s->pack_left;
 
-    if (unpack_size > output_size) {
-        return UNLZX_ERR_BUFFER_TOO_SMALL;
-    }
-
-    while (unpack_size > 0) {
-        count = (unpack_size > READ_BUFFER_SIZE) ? READ_BUFFER_SIZE : unpack_size;
-
-        if ((uint32_t)mem_read(ctx, ctx->read_buffer, count) != count) {
+        if ((uint32_t)mem_read(ctx, temp, count) != count) {
             return UNLZX_ERR_EOF;
         }
+        s->pack_left -= count;
 
-        memcpy(output, ctx->read_buffer, count);
-        output += count;
-        unpack_size -= count;
+        temp += count;
+        if (ctx->source >= temp) {
+            return UNLZX_ERR_EOF;
+        }
     }
 
+    if (ctx->decrunch_length <= 0) {
+        if (read_literal_table(ctx)) {
+            return UNLZX_ERR_CORRUPT_DATA;
+        }
+    }
+
+    if (ctx->destination >= ctx->decrunch_buffer + 258 + 65536) {
+        count = (uint32_t)(ctx->destination - ctx->decrunch_buffer - 65536);
+        if (count > 0) {
+            temp = (ctx->destination = ctx->decrunch_buffer) + 65536;
+            do {
+                *ctx->destination++ = *temp++;
+            } while (--count);
+        }
+        s->pos = ctx->destination;
+    }
+    ctx->destination_end = ctx->destination + ctx->decrunch_length;
+    if (ctx->destination_end > ctx->decrunch_buffer + 258 + 65536)
+        ctx->destination_end = ctx->decrunch_buffer + 258 + 65536;
+    temp = ctx->destination;
+
+    decrunch(ctx);
+
+    ctx->decrunch_length -= (uint32_t)(ctx->destination - temp);
+    return UNLZX_OK;
+}
+
+/* Hand out up to size bytes of the entry. The CRC is checked by the read that
+ * produces the entry's last byte. */
+static UnlzxError stream_read(UnlzxArchive* ctx, UnlzxStreamState* s, uint8_t* output, size_t size,
+                              size_t* bytes_read) {
+    size_t done = 0;
+    uint32_t count;
+
+    *bytes_read = 0;
+    if (s->error != UNLZX_OK) {
+        return s->error;
+    }
+
+    while (done < size && s->unpack_left > 0) {
+        count = s->unpack_left;
+        if (count > size - done) count = (uint32_t)(size - done);
+
+        if (s->pack_mode == 2) {
+            if (s->pos == ctx->destination) {
+                s->error = stream_decrunch(ctx, s);
+                if (s->error != UNLZX_OK) {
+                    return s->error;
+                }
+            }
+            if (count > (uint32_t)(ctx->destination - s->pos)) count = (uint32_t)(ctx->destination - s->pos);
+            memcpy(output + done, s->pos, count);
+            s->pos += count;
+        } else {
+            if (count > s->pack_left || (uint32_t)mem_read(ctx, output + done, count) != count) {
+                s->error = UNLZX_ERR_EOF;
+                return s->error;
+            }
+            s->pack_left -= count;
+        }
+
+        crc_calc(ctx, output + done, count);
+        done += count;
+        s->unpack_left -= count;
+    }
+
+    if (s->unpack_left == 0 && ctx->sum != s->crc) {
+        s->error = UNLZX_ERR_CORRUPT_DATA;
+        return s->error;
+    }
+
+    *bytes_read = done;
     return UNLZX_OK;
 }
 
@@ -701,10 +757,14 @@ static int add_entry(UnlzxArchive* ctx, const UnlzxEntryInternal* entry) {
         if (ctx->entry_count >= new_capacity) {
             return -1;
         }
-        UnlzxEntryInternal* new_entries = realloc(ctx->entries,
-                                                   new_capacity * sizeof(UnlzxEntryInternal));
+        UnlzxEntryInternal* new_entries = ctx->allocator.alloc(ctx->allocator.user,
+                                                               new_capacity * sizeof(UnlzxEntryInternal));
         if (!new_entries) {
             return -1;
+        }
+        if (ctx->entries) {
+            memcpy(new_entries, ctx->entries, ctx->entry_count * sizeof(UnlzxEntryInternal));
+            ctx->allocator.free(ctx->allocator.user, ctx->entries);
         }
         ctx->entries = new_entries;
         ctx->entry_capacity = new_capacity;
@@ -840,7 +900,7 @@ static UnlzxError parse_archive(UnlzxArchive* ctx) {
         }
     }
 
-    /* Fix up filename pointers after realloc */
+    /* Fix up filename pointers after the entry array moved */
     for (int i = 0; i < ctx->entry_count; i++) {
         ctx->entries[i].info.filename = ctx->entries[i].filename;
     }
@@ -852,14 +912,26 @@ static UnlzxError parse_archive(UnlzxArchive* ctx) {
 /* Public API */
 
 UnlzxArchive* unlzx_open_memory(const uint8_t* data, size_t size) {
+    return unlzx_open_memory_with_allocator(data, size, NULL);
+}
+
+UnlzxArchive* unlzx_open_memory_with_allocator(const uint8_t* data, size_t size,
+                                               const UnlzxAllocator* allocator) {
+    static const UnlzxAllocator default_allocator = { default_alloc, default_free, NULL };
+    if (!allocator) {
+        allocator = &default_allocator;
+    }
+
     if (!data || size < INFO_HEADER_SIZE) {
         return NULL;
     }
 
-    UnlzxArchive* ctx = calloc(1, sizeof(UnlzxArchive));
+    UnlzxArchive* ctx = alloc_zeroed(allocator, sizeof(UnlzxArchive));
     if (!ctx) {
         return NULL;
     }
+
+    ctx->allocator = *allocator;
 
     ctx->data = data;
     ctx->size = size;
@@ -910,43 +982,62 @@ UnlzxError unlzx_extract_entry(UnlzxArchive* archive, const UnlzxEntry* entry,
         return UNLZX_ERR_BUFFER_TOO_SMALL;
     }
 
-    /* Find internal entry */
-    const UnlzxEntryInternal* internal = NULL;
-    for (int i = 0; i < archive->entry_count; i++) {
-        if (&archive->entries[i].info == entry) {
-            internal = &archive->entries[i];
-            break;
-        }
-    }
-
+    const UnlzxEntryInternal* internal = find_internal_entry(archive, entry);
     if (!internal) {
         return UNLZX_ERR_INVALID_INDEX;
     }
 
-    UnlzxError err;
-    switch (entry->pack_mode) {
-        case 0:  /* Store */
-            err = extract_store_to_buffer(archive, internal, buffer, buffer_size);
-            break;
-        case 2:  /* Normal LZX compression */
-            err = extract_normal_to_buffer(archive, internal, buffer, buffer_size);
-            break;
-        default:
-            err = UNLZX_ERR_UNSUPPORTED;
-            break;
-    }
-
+    UnlzxStreamState state;
+    size_t bytes_read;
+    UnlzxError err = stream_begin(archive, &state, internal);
     if (err == UNLZX_OK) {
-        /* Verify CRC */
-        archive->sum = 0;
-        crc_calc(archive, buffer, entry->unpack_size);
-        if (archive->sum != entry->crc) {
-            err = UNLZX_ERR_CORRUPT_DATA;
-        }
+        err = stream_read(archive, &state, buffer, entry->unpack_size, &bytes_read);
     }
 
     archive->last_error = err;
     return err;
+}
+
+UnlzxError unlzx_stream_open(UnlzxArchive* archive, const UnlzxEntry* entry, UnlzxStream** stream) {
+    if (!archive || !entry || !stream) {
+        return UNLZX_ERR_INVALID_INDEX;
+    }
+    *stream = NULL;
+
+    const UnlzxEntryInternal* internal = find_internal_entry(archive, entry);
+    if (!internal) {
+        return UNLZX_ERR_INVALID_INDEX;
+    }
+
+    UnlzxStream* s = alloc_zeroed(&archive->allocator, sizeof(UnlzxStream));
+    if (!s) {
+        return UNLZX_ERR_OUT_OF_MEMORY;
+    }
+    s->ctx.data = archive->data;
+    s->ctx.size = archive->size;
+    s->ctx.allocator = archive->allocator;
+
+    UnlzxError err = stream_begin(&s->ctx, &s->state, internal);
+    if (err != UNLZX_OK) {
+        unlzx_stream_close(s);
+        return err;
+    }
+
+    *stream = s;
+    return UNLZX_OK;
+}
+
+UnlzxError unlzx_stream_read(UnlzxStream* stream, uint8_t* buffer, size_t size, size_t* bytes_read) {
+    if (!stream || !buffer || !bytes_read) {
+        return UNLZX_ERR_INVALID_INDEX;
+    }
+    return stream_read(&stream->ctx, &stream->state, buffer, size, bytes_read);
+}
+
+void unlzx_stream_close(UnlzxStream* stream) {
+    if (stream) {
+        stream->ctx.allocator.free(stream->ctx.allocator.user, stream);
+    }
 }
 
 UnlzxError unlzx_get_last_error(UnlzxArchive* archive) {
@@ -955,7 +1046,10 @@ UnlzxError unlzx_get_last_error(UnlzxArchive* archive) {
 
 void unlzx_close(UnlzxArchive* archive) {
     if (archive) {
-        free(archive->entries);
-        free(archive);
+        UnlzxAllocator allocator = archive->allocator;
+        if (archive->entries) {
+            allocator.free(allocator.user, archive->entries);
+        }
+        allocator.free(allocator.user, archive);
     }
 }
