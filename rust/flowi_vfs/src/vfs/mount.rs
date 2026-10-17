@@ -476,6 +476,61 @@ impl WorkerMount {
         Ok(buffer)
     }
 
+    /// Read the whole of path in order, at most chunk_size bytes at a time,
+    /// handing each piece to each as it arrives. Memory stays at one chunk
+    /// however large the file is - the read for hashing a multi-gigabyte image.
+    pub fn read_chunks(
+        &self,
+        path: &str,
+        chunk_size: usize,
+        mut each: impl FnMut(&[u8]),
+    ) -> Result<(), FlError> {
+        if chunk_size == 0 {
+            return Err(FlError::GenericError);
+        }
+        let mount = &self.mount;
+        let mut buffer = vec![0u8; chunk_size];
+        // SAFETY: a live mount; path is borrowed for the open only. buffer
+        // outlives every wait below, which is what vfs_read's no-copy contract
+        // requires, and every ticket is closed on every path out.
+        let file =
+            unsafe { ffi::vfs_mount_open(mount.raw, sys::RawStr::borrow(path), VFS_OPEN_READ) };
+        if file == FL_VFS_HANDLE_INVALID {
+            return Err(FlError::GenericError);
+        }
+        let result = loop {
+            // SAFETY: file is the open handle above, and buffer holds chunk_size bytes.
+            let read = unsafe {
+                ffi::vfs_read(
+                    file,
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    chunk_size as i64,
+                )
+            };
+            if read == FL_VFS_HANDLE_INVALID {
+                break Err(FlError::GenericError);
+            }
+            // SAFETY: read is a live ticket, waited on and closed exactly once.
+            let data = unsafe {
+                ffi::vfs_wait(read);
+                let data = ffi::vfs_get_data(read);
+                ffi::vfs_close(read);
+                data
+            };
+            if !data.success {
+                break Err(FlError::GenericError);
+            }
+            let read_bytes = (data.size.max(0) as usize).min(chunk_size);
+            if read_bytes == 0 {
+                break Ok(());
+            }
+            each(&buffer[..read_bytes]);
+        };
+        // SAFETY: file is closed exactly once, after its last read.
+        unsafe { ffi::vfs_close(file) };
+        result
+    }
+
     /// List path to depth (1 = immediate children), waiting for the entries.
     pub fn listing(&self, path: &str, depth: i32) -> Result<FileList, FlError> {
         let mount = &self.mount;

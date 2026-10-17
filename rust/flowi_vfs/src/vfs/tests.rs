@@ -624,3 +624,25 @@ fn read_prefix_bounds_the_read_and_keeps_a_short_file_whole() {
     assert_eq!(view.read_prefix("blob.bin", 0).expect("prefix"), b"");
     assert_eq!(with_fake(|f| f.close_count), 4);
 }
+
+#[test]
+fn read_chunks_walks_the_file_in_order_and_closes_every_ticket() {
+    reset_fake(FakeState {
+        prefix: b"0123456789".to_vec(),
+        ..Default::default()
+    });
+    let mount = Vfs::mount("/data").expect("mount");
+    // SAFETY: the mount outlives the view.
+    let view = unsafe { mount.worker_view() };
+
+    let mut pieces: Vec<Vec<u8>> = Vec::new();
+    view.read_chunks("blob.bin", 4, |bytes| pieces.push(bytes.to_vec()))
+        .expect("chunks");
+    // Full chunks, then the short tail; the empty read that ends the file is not handed on.
+    assert_eq!(pieces, [b"0123".to_vec(), b"4567".to_vec(), b"89".to_vec()]);
+    // Four reads (three with bytes, one at the end) and the file handle itself.
+    assert_eq!(with_fake(|f| f.close_count), 5);
+    // A zero chunk size is refused before anything is opened.
+    assert!(view.read_chunks("blob.bin", 0, |_| {}).is_err());
+    assert_eq!(with_fake(|f| f.close_count), 5);
+}

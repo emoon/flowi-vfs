@@ -102,6 +102,9 @@ pub(super) struct FakeState {
     pub(super) prefix: Vec<u8>,
     /// The last size vfs_read was asked for.
     pub(super) prefix_requested: i64,
+    /// Where the next vfs_read starts in prefix. An open rewinds it and each read advances it, so
+    /// successive reads on one file walk prefix the way they walk a real file.
+    pub(super) read_pos: usize,
     /// The names/entries the callback path saw, so a read_with test can
     /// assert the transform ran on the bytes the read produced.
     pub(super) last_callback_size: i64,
@@ -149,6 +152,7 @@ impl Default for FakeState {
             init_arena: core::ptr::null_mut(),
             prefix: Vec::new(),
             prefix_requested: 0,
+            read_pos: 0,
             last_callback_size: -1,
             mount_job_handle: 0,
             read: None,
@@ -294,11 +298,14 @@ unsafe extern "C" fn fake_mount_open(
     _path: sys::RawStr,
     _flags: u32,
 ) -> u32 {
-    if with_fake(|f| f.launch_invalid) {
-        FL_VFS_HANDLE_INVALID
-    } else {
-        3
-    }
+    with_fake(|f| {
+        if f.launch_invalid {
+            FL_VFS_HANDLE_INVALID
+        } else {
+            f.read_pos = 0;
+            3
+        }
+    })
 }
 
 /// # Safety
@@ -306,11 +313,13 @@ unsafe extern "C" fn fake_mount_open(
 unsafe extern "C" fn fake_read(_file: u32, buffer: *mut c_void, size: i64) -> u32 {
     with_fake(|f| {
         f.prefix_requested = size;
-        let count = f.prefix.len().min(size.max(0) as usize);
+        let rest = &f.prefix[f.read_pos.min(f.prefix.len())..];
+        let count = rest.len().min(size.max(0) as usize);
         // SAFETY: the caller's contract gives size writable bytes at buffer, and count is clamped
         // to that; the fixture's own prefix is the disjoint source.
-        unsafe { core::ptr::copy_nonoverlapping(f.prefix.as_ptr(), buffer.cast::<u8>(), count) };
-        f.data = f.prefix[..count].to_vec();
+        unsafe { core::ptr::copy_nonoverlapping(rest.as_ptr(), buffer.cast::<u8>(), count) };
+        f.data = rest[..count].to_vec();
+        f.read_pos += count;
     });
     4
 }
