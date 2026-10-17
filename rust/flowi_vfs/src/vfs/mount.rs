@@ -586,6 +586,19 @@ impl Vfs {
         unsafe { ffi::vfs_init(arena.as_raw()) }
     }
 
+    /// Register every archive driver this build of the library contains, ahead of
+    /// the LocalFS fallback. Which ones that is was decided when the C library was
+    /// built (its FLOWI_VFS_DRIVER_* options); with none, this does nothing.
+    ///
+    /// Call it once, after the VFS is up - [`Vfs::init`], or the bring-up of a
+    /// [`crate::Application`]. Each call registers the drivers again.
+    #[inline]
+    pub fn register_builtin_drivers() {
+        // SAFETY: takes nothing and returns nothing; registering before the VFS
+        // is up is reported by the C and changes nothing.
+        unsafe { ffi::vfs_register_builtin_drivers() }
+    }
+
     /// Mount source_path - a directory, an archive, or a URL; which driver handles
     /// it is the VFS's business, not the caller's. Uses the default
     /// [`MountOptions`].

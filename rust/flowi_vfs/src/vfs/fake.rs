@@ -98,6 +98,8 @@ pub(super) struct FakeState {
     pub(super) wait_count: u32,
     /// The arena the last vfs_init was handed.
     pub(super) init_arena: *mut sys::Arena,
+    /// How many times vfs_register_builtin_drivers was called.
+    pub(super) builtin_registrations: u32,
     /// Bytes vfs_read copies into the caller's buffer.
     pub(super) prefix: Vec<u8>,
     /// The last size vfs_read was asked for.
@@ -150,6 +152,7 @@ impl Default for FakeState {
             mount_closed: false,
             wait_count: 0,
             init_arena: core::ptr::null_mut(),
+            builtin_registrations: 0,
             prefix: Vec::new(),
             prefix_requested: 0,
             read_pos: 0,
@@ -449,6 +452,7 @@ pub(super) fn fake_table() -> fake::VfsApi {
         vfs_close: fake_close,
         vfs_mount_get_job_handle: fake_mount_get_job_handle,
         vfs_init: fake_init,
+        vfs_register_builtin_drivers: fake_register_builtin_drivers,
         ..fake::VfsApi::unimplemented()
     }
 }
@@ -458,6 +462,10 @@ unsafe extern "C" fn fake_init(arena: *mut sys::Arena) -> bool {
         f.init_arena = arena;
         !f.fail
     })
+}
+
+unsafe extern "C" fn fake_register_builtin_drivers() {
+    with_fake(|f| f.builtin_registrations += 1);
 }
 
 unsafe extern "C" fn fake_mount_get_job_handle(_mount: *mut sys::FlVfsMount) -> sys::JobHandle {

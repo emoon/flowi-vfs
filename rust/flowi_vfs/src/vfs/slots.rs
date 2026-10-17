@@ -17,6 +17,7 @@ macro_rules! vfs_slots {
     ($emit:ident) => {
         $emit! {
             vfs_init(arena: *mut sys::Arena) -> bool;
+            vfs_register_builtin_drivers();
             vfs_mount_with_options(path: sys::RawStr, options: sys::VfsMountOptions) -> sys::VfsMountResult;
             vfs_mount_close(mount: *mut sys::FlVfsMount);
             vfs_mount_get_job_handle(mount: *mut sys::FlVfsMount) -> sys::JobHandle;

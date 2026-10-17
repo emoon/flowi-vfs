@@ -14,6 +14,13 @@ use std::sync::Arc;
 /// says - a refusal (a job system too large for the handle array, say) is a
 /// false the caller has to act on, not something the wrapper swallows.
 #[test]
+fn register_builtin_drivers_reaches_the_c_once_per_call() {
+    reset_fake(FakeState::default());
+    Vfs::register_builtin_drivers();
+    assert_eq!(with_fake(|f| f.builtin_registrations), 1);
+}
+
+#[test]
 fn init_forwards_the_arena_and_reports_refusal() {
     reset_fake(FakeState::default());
     let arena = crate::Arena::new(1 << 16);

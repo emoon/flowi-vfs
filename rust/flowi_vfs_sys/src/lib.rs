@@ -1,5 +1,5 @@
 //! The raw C ABI of flowi's VFS: the consumer surface, the driver-plugin vtable, and the
-//! two hand-written entry points that have no IDL description.
+//! three hand-written entry points that have no IDL description.
 //!
 //! Everything in [`generated`] is single-sourced from `api/*.def` - api_gen emits both the
 //! Rust binding here and the real `Fl*` C typedef in `include/flowi/vfs/*.h`. The Rust
@@ -53,9 +53,10 @@ pub use generated::vfs_plugin::{
     VfsWriteResult,
 };
 
-// The two functions the IDL does not describe: vfs_init takes the arena by pointer and
-// vfs_mount_get_job_handle returns a core type, so both are declared by hand here rather
-// than generated. They are exported by the same library as everything above.
+// The functions the IDL does not describe: vfs_init takes the arena by pointer,
+// vfs_mount_get_job_handle returns a core type, and vfs_register_builtin_drivers belongs to
+// the hand-written <flowi/vfs/drivers.h>, so all three are declared by hand here rather than
+// generated. They are exported by the same library as everything above.
 extern "C" {
     /// Bring the VFS singleton up against arena and register the built-in
     /// LocalFS driver (vfs/vfs.h). False when it is already up, or when the job
@@ -66,4 +67,8 @@ extern "C" {
     /// through the mount can be scheduled after it rather than polled for
     /// readiness. [`JobHandle::INVALID`] once the mount is up.
     pub fn vfs_mount_get_job_handle(mount: *mut FlVfsMount) -> JobHandle;
+
+    /// Register every archive driver this build of the library contains
+    /// (flowi/vfs/drivers.h), after vfs_init. A no-op when it contains none.
+    pub fn vfs_register_builtin_drivers();
 }
